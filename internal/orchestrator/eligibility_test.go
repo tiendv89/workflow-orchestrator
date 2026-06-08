@@ -103,7 +103,7 @@ func TestFindEligibleTasks_ReturnsOnlyGoReadyTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertFeature: %v", err)
 	}
-	featureRowID = row.ID
+	featureRowID = row.FeatureID
 
 	goOwner := ptr("go")
 	noOwner := (*string)(nil)
