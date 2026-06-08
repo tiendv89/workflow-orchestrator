@@ -3,11 +3,9 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
 
@@ -70,61 +68,21 @@ func processMergedPR(
 		return nil // PR still open — nothing to do
 	}
 
-	// Apply SetDone + AutoReadyDependents in one transaction.
-	if err := setDoneWithAutoReady(ctx, pool, workspaceID, task.TaskID, task.TaskName); err != nil {
-		return fmt.Errorf("setDoneWithAutoReady: %w", err)
+	// SetDone transitions in_review → done and auto-readies dependents in one tx.
+	ok, err := SetDone(ctx, pool, workspaceID, task.TaskID)
+	if err != nil {
+		return fmt.Errorf("SetDone: %w", err)
 	}
-
-	// Append done activity log entry (has its own transaction).
-	if err := AppendLog(ctx, pool, workspaceID, task.FeatureID, task.TaskID,
-		"done", "orchestrator", "PR merged — task marked done."); err != nil {
-		log.Warn().Err(err).
-			Str("task_name", task.TaskName).
-			Msg("AppendLog done failed; transition already committed")
+	if ok {
+		// Append done activity log entry only when the transition was applied.
+		if err := AppendLog(ctx, pool, workspaceID, task.FeatureID, task.TaskID,
+			"done", "orchestrator", "PR merged — task marked done."); err != nil {
+			log.Warn().Err(err).
+				Str("task_name", task.TaskName).
+				Msg("AppendLog done failed; transition already committed")
+		}
 	}
 	return nil
-}
-
-// setDoneWithAutoReady atomically transitions a task from "in_review" to "done"
-// and advances any dependents whose full dependency set is now satisfied.
-// Both operations run inside a single pgx transaction.
-func setDoneWithAutoReady(
-	ctx context.Context,
-	pool *pgxpool.Pool,
-	workspaceID, taskUUID uuid.UUID,
-	taskName string,
-) error {
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-
-	// Guarded UPDATE: in_review → done.
-	var id uuid.UUID
-	err = tx.QueryRow(ctx, `
-		UPDATE workspace_tasks
-		SET    status     = 'done',
-		       updated_at = now()
-		WHERE  workspace_id = $1
-		  AND  task_id      = $2
-		  AND  status       = 'in_review'
-		RETURNING id
-	`, workspaceID, taskUUID).Scan(&id)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// Already done or status changed concurrently — not an error.
-			return nil
-		}
-		return fmt.Errorf("SetDone UPDATE: %w", err)
-	}
-
-	// Auto-ready dependents within the same transaction.
-	if _, err := AutoReadyDependents(ctx, tx, workspaceID, taskName); err != nil {
-		return fmt.Errorf("AutoReadyDependents: %w", err)
-	}
-
-	return tx.Commit(ctx)
 }
 
 // extractPRURL parses the url field from the pr JSONB column.
