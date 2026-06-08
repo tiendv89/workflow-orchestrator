@@ -186,6 +186,7 @@ WHERE t.workspace_id = $1
             AND dep_task.status      = 'done'
       )
   )
+ORDER BY t.created_at ASC
 `
 
 // Returns go-owned tasks in 'ready' status whose every dependency task_name
