@@ -14,6 +14,9 @@ type Config struct {
 	OrganizationID      string
 	BrokerURL           string
 	GitHubToken         string
+	RedisURL            string
+	ManagementRepo      string
+	BaseBranch          string
 	PollIntervalSeconds int
 }
 
@@ -28,6 +31,13 @@ func Load() (*Config, error) {
 	cfg.OrganizationID = requireEnv("ORGANIZATION_ID", &errs)
 	cfg.BrokerURL = requireEnv("BROKER_URL", &errs)
 	cfg.GitHubToken = requireEnv("GITHUB_TOKEN", &errs)
+	cfg.RedisURL = requireEnv("REDIS_URL", &errs)
+	cfg.ManagementRepo = requireEnv("MANAGEMENT_REPO", &errs)
+
+	cfg.BaseBranch = os.Getenv("BASE_BRANCH")
+	if cfg.BaseBranch == "" {
+		cfg.BaseBranch = "main"
+	}
 
 	cfg.PollIntervalSeconds = 15
 	if raw := os.Getenv("POLL_INTERVAL_SECONDS"); raw != "" {
