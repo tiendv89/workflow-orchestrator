@@ -113,23 +113,85 @@ func InitialAutoReady(ctx context.Context, pool *pgxpool.Pool, workspaceID, feat
 	return nil
 }
 
-// MaterializeFeature creates a feature and all its tasks, then seeds status='ready'
-// for tasks that have no dependencies.
+// MaterializeFeature creates a feature and all its tasks in a single transaction,
+// then seeds status='ready' for tasks that have no dependencies.
 func MaterializeFeature(ctx context.Context, pool *pgxpool.Pool, spec GoFeatureSpec) error {
-	featureID, err := CreateFeature(ctx, pool, spec)
+	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("MaterializeFeature: %w", err)
+		return fmt.Errorf("MaterializeFeature: begin tx: %w", err)
 	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	q := queries.New(tx)
+	featureID := uuid.New()
+	owner := ownerGo
+	status := "in_design"
+	stage := "product_spec"
+
+	row, err := q.InsertFeature(ctx, queries.InsertFeatureParams{
+		WorkspaceID:   spec.WorkspaceID,
+		FeatureID:     featureID,
+		FeatureName:   spec.Slug,
+		Title:         spec.Title,
+		FeatureStatus: &status,
+		CurrentStage:  &stage,
+		SourcePath:    nil,
+		Owner:         &owner,
+	})
+	if err != nil {
+		return fmt.Errorf("MaterializeFeature: insert feature: %w", err)
+	}
+	featureID = row.FeatureID
 
 	for _, t := range spec.Tasks {
-		if _, err := CreateTask(ctx, pool, featureID, spec.Slug, spec.WorkspaceID, t); err != nil {
-			return fmt.Errorf("MaterializeFeature: %w", err)
+		taskID := uuid.New()
+		taskOwner := ownerGo
+		taskStatus := "todo"
+
+		dependsOnJSON, err := json.Marshal(t.DependsOn)
+		if err != nil {
+			return fmt.Errorf("MaterializeFeature: marshal depends_on for %s: %w", t.Name, err)
+		}
+
+		var repo *string
+		if t.Repo != "" {
+			r := t.Repo
+			repo = &r
+		}
+
+		if _, err := q.InsertTask(ctx, queries.InsertTaskParams{
+			WorkspaceID: spec.WorkspaceID,
+			FeatureID:   featureID,
+			FeatureName: spec.Slug,
+			TaskID:      taskID,
+			TaskName:    t.Name,
+			Title:       t.Title,
+			Repo:        repo,
+			Status:      &taskStatus,
+			DependsOn:   dependsOnJSON,
+			Branch:      nil,
+			SourcePath:  nil,
+			Owner:       &taskOwner,
+		}); err != nil {
+			return fmt.Errorf("MaterializeFeature: insert task %s: %w", t.Name, err)
 		}
 	}
 
-	if err := InitialAutoReady(ctx, pool, spec.WorkspaceID, featureID); err != nil {
-		return fmt.Errorf("MaterializeFeature: %w", err)
+	// Advance tasks with empty depends_on to 'ready' within the same transaction.
+	if _, err := tx.Exec(ctx, `
+		UPDATE workspace_tasks
+		SET    status     = 'ready',
+		       updated_at = now()
+		WHERE  workspace_id = $1
+		  AND  feature_id   = $2
+		  AND  depends_on   = '[]'::jsonb
+		  AND  status       = 'todo'
+	`, spec.WorkspaceID, featureID); err != nil {
+		return fmt.Errorf("MaterializeFeature: InitialAutoReady: %w", err)
 	}
 
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("MaterializeFeature: commit: %w", err)
+	}
 	return nil
 }

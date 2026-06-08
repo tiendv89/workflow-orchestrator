@@ -41,9 +41,9 @@ func insertWorkspace(t *testing.T, ctx context.Context, pool *pgxpool.Pool, orgI
 		t.Fatalf("insert workspace: %v", err)
 	}
 	t.Cleanup(func() {
-		pool.Exec(ctx, `DELETE FROM workspace_tasks    WHERE workspace_id=$1`, wsID)
-		pool.Exec(ctx, `DELETE FROM workspace_features WHERE workspace_id=$1`, wsID)
-		pool.Exec(ctx, `DELETE FROM workspaces         WHERE id=$1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspace_tasks    WHERE workspace_id=$1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspace_features WHERE workspace_id=$1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspaces         WHERE id=$1`, wsID)
 	})
 	return wsID
 }
