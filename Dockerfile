@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ----- build stage -----
-FROM golang:1.24-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /src
 
@@ -11,9 +11,11 @@ RUN go mod download
 
 COPY . .
 
-# Build both binaries.
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/orchestrator ./cmd/orchestrator
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/seed ./cmd/seed
+# Build both binaries. GOTOOLCHAIN=local prevents any network-side toolchain
+# download when there is a minor patch-version mismatch between the image and
+# go.mod — the image toolchain is used as-is.
+RUN CGO_ENABLED=0 GOOS=linux GOTOOLCHAIN=local go build -o /out/orchestrator ./cmd/orchestrator
+RUN CGO_ENABLED=0 GOOS=linux GOTOOLCHAIN=local go build -o /out/seed ./cmd/seed
 
 # ----- runtime image -----
 FROM alpine:3.21

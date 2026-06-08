@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -41,6 +42,106 @@ func TestHealthzEndpoint(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "ok" {
 		t.Errorf("body = %q, want %q", string(body), "ok")
+	}
+}
+
+// TestStartHealthzServer_BindError verifies that a port-conflict on the healthz
+// server does not terminate the process. The goroutine must return cleanly
+// (logging the error) rather than calling log.Fatal / os.Exit.
+func TestStartHealthzServer_BindError(t *testing.T) {
+	// Hold a port so the second bind is guaranteed to fail.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pre-bind: %v", err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		startHealthzServer(ctx, addr) // must log error and return — not call os.Exit
+	}()
+
+	select {
+	case <-done:
+		// goroutine exited cleanly after the bind error — test passes
+	case <-time.After(500 * time.Millisecond):
+		t.Error("startHealthzServer blocked after bind failure — expected it to log and return")
+	}
+}
+
+// --- pollState tests ---
+
+func TestPollState_SuccessResetsToBase(t *testing.T) {
+	ps := newPollState(10) // base = 10s, maxBackoff = 50s
+
+	// Trigger some backoff first.
+	ps.next(true)
+	ps.next(true)
+	if ps.current == ps.base {
+		t.Fatal("expected current to be above base after errors")
+	}
+
+	// Success should reset to base.
+	ps.next(false)
+	if ps.current != ps.base {
+		t.Errorf("current = %v after success reset, want %v", ps.current, ps.base)
+	}
+}
+
+func TestPollState_ErrorDoublesInterval(t *testing.T) {
+	ps := newPollState(10) // base = 10s
+
+	ps.next(true) // 10 → 20
+	if ps.current != 20*time.Second {
+		t.Errorf("after 1 error: current = %v, want 20s", ps.current)
+	}
+
+	ps.next(true) // 20 → 40
+	if ps.current != 40*time.Second {
+		t.Errorf("after 2 errors: current = %v, want 40s", ps.current)
+	}
+}
+
+func TestPollState_CapsAtMaxBackoff(t *testing.T) {
+	ps := newPollState(10) // maxBackoff = 50s
+
+	for i := 0; i < 10; i++ {
+		ps.next(true)
+	}
+	if ps.current != ps.maxBackoff {
+		t.Errorf("current = %v after many errors, want maxBackoff = %v", ps.current, ps.maxBackoff)
+	}
+}
+
+func TestPollState_JitterInRange(t *testing.T) {
+	ps := newPollState(10) // base = 10s, jitter ±20% → [8s, 12s]
+
+	for i := 0; i < 100; i++ {
+		d := ps.next(false)
+		lo := time.Duration(float64(ps.base) * 0.8)
+		hi := time.Duration(float64(ps.base) * 1.2)
+		if d < lo || d > hi {
+			t.Errorf("iter %d: jittered duration %v outside [%v, %v]", i, d, lo, hi)
+		}
+	}
+}
+
+func TestPollState_ErrorJitterInRange(t *testing.T) {
+	ps := newPollState(10) // after 1 error: current=20s, jitter → [16s, 24s]
+
+	for i := 0; i < 100; i++ {
+		ps.current = ps.base // reset state each iter
+		d := ps.next(true)   // forces current → 20s
+		lo := time.Duration(float64(20*time.Second) * 0.8)
+		hi := time.Duration(float64(20*time.Second) * 1.2)
+		if d < lo || d > hi {
+			t.Errorf("iter %d: error jitter %v outside [%v, %v]", i, d, lo, hi)
+		}
 	}
 }
 
@@ -100,12 +201,14 @@ func TestRunCycle_NoEligibleTasks(t *testing.T) {
 	wsID := uuid.New()
 	lc := fixedHandleLC(nil, nil, false, nil, nil, nil, nil, nil)
 
-	// Must not panic.
-	runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	if hadError {
+		t.Error("expected hadError=false with no tasks and no errors")
+	}
 }
 
 // TestRunCycle_FindEligibleError verifies that a FindEligibleTasks error is
-// isolated — the cycle continues to reap and merge-poll.
+// isolated — the cycle continues to reap and merge-poll — and returns true.
 func TestRunCycle_FindEligibleError(t *testing.T) {
 	cfg := minimalCfg()
 	hs := orchestrator.NewHandleStore()
@@ -138,8 +241,11 @@ func TestRunCycle_FindEligibleError(t *testing.T) {
 		newHandle: uuid.New,
 	}
 
-	runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
 
+	if !hadError {
+		t.Error("expected hadError=true when FindEligibleTasks fails")
+	}
 	if !reapCalled {
 		t.Error("expected ReapCompleted to be called despite FindEligibleTasks error")
 	}
@@ -158,8 +264,10 @@ func TestRunCycle_AllStepsError(t *testing.T) {
 	boom := errors.New("boom")
 	lc := fixedHandleLC(nil, boom, false, boom, boom, boom, boom, nil)
 
-	// Must not panic.
-	runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	if !hadError {
+		t.Error("expected hadError=true when all steps fail")
+	}
 }
 
 // TestRunCycle_ClaimLost verifies that a lost claim (won=false) does not
@@ -261,8 +369,11 @@ func TestRunCycle_DispatchError(t *testing.T) {
 		newHandle: uuid.New,
 	}
 
-	runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
 
+	if !hadError {
+		t.Error("expected hadError=true when dispatch fails")
+	}
 	if _, ok := hs.Lookup(usedHandle); ok {
 		t.Errorf("handle %q should not be registered after dispatch error", usedHandle)
 	}
@@ -311,7 +422,10 @@ func TestRunCycle_HappyPath(t *testing.T) {
 		newHandle: func() uuid.UUID { return fixedHandle },
 	}
 
-	runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	if hadError {
+		t.Error("expected hadError=false on happy path")
+	}
 
 	entry, ok := hs.Lookup(fixedHandle.String())
 	if !ok {
