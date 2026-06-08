@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/tiendv89/workflow-orchestrator/internal/config"
 	db "github.com/tiendv89/workflow-orchestrator/internal/database/queries"
@@ -23,6 +22,12 @@ type Streamer interface {
 // redisStreamer adapts *redis.Client to Streamer.
 type redisStreamer struct {
 	rdb *redis.Client
+}
+
+// NewRedisStreamer wraps a pre-created *redis.Client as a Streamer.
+// Create the client once at startup and reuse across all dispatch calls.
+func NewRedisStreamer(rdb *redis.Client) Streamer {
+	return &redisStreamer{rdb: rdb}
 }
 
 func (r *redisStreamer) StreamAdd(ctx context.Context, stream string, values map[string]string) error {
@@ -48,6 +53,7 @@ type handleMetadata struct {
 }
 
 // Dispatcher handles broker registration and Redis stream enqueuing for a task.
+// Create one instance at startup via NewDispatcher and reuse across the poll loop.
 type Dispatcher struct {
 	brokerURL  string
 	httpClient *http.Client
@@ -62,8 +68,10 @@ func NewDispatcher(brokerURL string, stream Streamer, httpClient *http.Client) *
 	return &Dispatcher{brokerURL: brokerURL, httpClient: httpClient, stream: stream}
 }
 
-// dispatch registers the handle with the broker and enqueues the DispatchJob.
-func (d *Dispatcher) dispatch(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error {
+// Dispatch registers the handle with the broker and enqueues the DispatchJob.
+// The Dispatcher (and its underlying Streamer/Redis client) must be created once
+// at startup and shared across calls to avoid connection leaks.
+func (d *Dispatcher) Dispatch(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	if err := d.registerHandle(ctx, handle, task, cfg.OrganizationID, now); err != nil {
@@ -129,13 +137,4 @@ func (d *Dispatcher) enqueueJob(ctx context.Context, cfg *config.Config, task db
 	}
 
 	return d.stream.StreamAdd(ctx, "platform:dispatch", values)
-}
-
-// DispatchTask is the package-level convenience function that creates a real
-// Dispatcher from cfg and invokes dispatch. The pool parameter is accepted for
-// interface consistency with other orchestrator functions but is not used here.
-func DispatchTask(ctx context.Context, cfg *config.Config, _ *pgxpool.Pool, task db.WorkspaceTask, handle string) error {
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisURL})
-	d := NewDispatcher(cfg.BrokerURL, &redisStreamer{rdb: rdb}, nil)
-	return d.dispatch(ctx, cfg, task, handle)
 }

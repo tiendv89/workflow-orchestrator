@@ -80,7 +80,7 @@ func TestDispatch_BrokerRegistration(t *testing.T) {
 	cfg := newTestConfig(srv.URL)
 	task := newTestTask()
 
-	if err := d.dispatch(context.Background(), cfg, task, "handle-abc"); err != nil {
+	if err := d.Dispatch(context.Background(), cfg, task, "handle-abc"); err != nil {
 		t.Fatalf("dispatch returned error: %v", err)
 	}
 
@@ -117,7 +117,7 @@ func TestDispatch_RedisStreamEntry(t *testing.T) {
 	cfg := newTestConfig(srv.URL)
 	task := newTestTask()
 
-	if err := d.dispatch(context.Background(), cfg, task, "handle-xyz"); err != nil {
+	if err := d.Dispatch(context.Background(), cfg, task, "handle-xyz"); err != nil {
 		t.Fatalf("dispatch returned error: %v", err)
 	}
 
@@ -156,7 +156,7 @@ func TestDispatch_BrokerError(t *testing.T) {
 	cfg := newTestConfig(srv.URL)
 	task := newTestTask()
 
-	err := d.dispatch(context.Background(), cfg, task, "handle-err")
+	err := d.Dispatch(context.Background(), cfg, task, "handle-err")
 	if err == nil {
 		t.Fatal("expected error for non-200 broker response, got nil")
 	}
@@ -174,7 +174,7 @@ func TestDispatch_StreamError(t *testing.T) {
 	cfg := newTestConfig(srv.URL)
 	task := newTestTask()
 
-	err := d.dispatch(context.Background(), cfg, task, "handle-redis-err")
+	err := d.Dispatch(context.Background(), cfg, task, "handle-redis-err")
 	if err == nil {
 		t.Fatal("expected error for redis failure, got nil")
 	}
