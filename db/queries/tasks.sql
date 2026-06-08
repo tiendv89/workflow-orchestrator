@@ -61,9 +61,10 @@ INSERT INTO workspace_tasks (
     depends_on,
     branch,
     source_path,
-    owner
+    owner,
+    execution
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb
 )
 RETURNING id, task_id;
 

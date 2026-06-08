@@ -121,9 +121,10 @@ INSERT INTO workspace_tasks (
     depends_on,
     branch,
     source_path,
-    owner
+    owner,
+    execution
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb
 )
 RETURNING id, task_id
 `
@@ -141,6 +142,7 @@ type InsertTaskParams struct {
 	Branch      *string   `json:"branch"`
 	SourcePath  *string   `json:"source_path"`
 	Owner       *string   `json:"owner"`
+	Execution   []byte    `json:"execution"`
 }
 
 type InsertTaskRow struct {
@@ -162,6 +164,7 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (InsertT
 		arg.Branch,
 		arg.SourcePath,
 		arg.Owner,
+		arg.Execution,
 	)
 	var i InsertTaskRow
 	err := row.Scan(&i.ID, &i.TaskID)

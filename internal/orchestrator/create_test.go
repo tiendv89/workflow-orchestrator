@@ -148,6 +148,13 @@ func TestCreateTask_Integration(t *testing.T) {
 	if len(deps) != 0 {
 		t.Errorf("depends_on = %v, want []", deps)
 	}
+	var exec map[string]string
+	if err := json.Unmarshal(tk.Execution, &exec); err != nil {
+		t.Fatalf("unmarshal execution: %v", err)
+	}
+	if exec["actor_type"] != "agent" {
+		t.Errorf("execution.actor_type = %q, want 'agent'", exec["actor_type"])
+	}
 }
 
 func TestCreateTask_WithDependsOn(t *testing.T) {
@@ -294,9 +301,14 @@ func TestMaterializeFeature_Integration(t *testing.T) {
 	}
 
 	statusByName := map[string]string{}
+	actorByName := map[string]string{}
 	for _, tk := range tasks {
 		if tk.Status != nil {
 			statusByName[tk.TaskName] = *tk.Status
+		}
+		var exec map[string]string
+		if err := json.Unmarshal(tk.Execution, &exec); err == nil {
+			actorByName[tk.TaskName] = exec["actor_type"]
 		}
 	}
 	if statusByName["T1"] != "ready" {
@@ -307,5 +319,14 @@ func TestMaterializeFeature_Integration(t *testing.T) {
 	}
 	if statusByName["T3"] != "ready" {
 		t.Errorf("T3 status = %q, want 'ready'", statusByName["T3"])
+	}
+	if actorByName["T1"] != "agent" {
+		t.Errorf("T1 execution.actor_type = %q, want 'agent'", actorByName["T1"])
+	}
+	if actorByName["T2"] != "agent" {
+		t.Errorf("T2 execution.actor_type = %q, want 'agent'", actorByName["T2"])
+	}
+	if actorByName["T3"] != "human" {
+		t.Errorf("T3 execution.actor_type = %q, want 'human'", actorByName["T3"])
 	}
 }
