@@ -88,6 +88,15 @@ func newTestReaper(srv *httptest.Server, ft *fakeTransition) *Reaper {
 	}
 }
 
+// ackOK writes a 204 response for POST /ack requests.
+func ackOK(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.Path == "/ack" && r.Method == http.MethodPost {
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+	return false
+}
+
 // --- tests ---
 
 // TestReap_GoCompletion_InReview verifies that a go completion with
@@ -110,6 +119,9 @@ func TestReap_GoCompletion_InReview(t *testing.T) {
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
 		if r.URL.Path != "/list-completed" {
 			t.Errorf("unexpected path %q", r.URL.Path)
 		}
@@ -191,7 +203,10 @@ func TestReap_GoCompletion_Blocked(t *testing.T) {
 		},
 	}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
 	}))
