@@ -186,8 +186,10 @@ type faithfulBroker struct {
 	// in-flight registry: handle → entry
 	registry map[string]faithfulEntry
 
-	// completion queue
-	queue []faithfulCompletion
+	// per-owner completion queues: owner → completions
+	// Mirrors real broker partitioning: list-completed filters by owner so a
+	// "ts" drain cannot observe items enqueued for "go" and vice versa.
+	queues map[string][]faithfulCompletion
 
 	// recorded request bodies for invariant assertions
 	registerBodies      []registerBody
@@ -222,6 +224,7 @@ type listCompletedBody struct {
 func newFaithfulBroker() *faithfulBroker {
 	return &faithfulBroker{
 		registry: make(map[string]faithfulEntry),
+		queues:   make(map[string][]faithfulCompletion),
 	}
 }
 
@@ -328,8 +331,9 @@ func (b *faithfulBroker) handleCallback(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Enqueue the completion.
-	b.queue = append(b.queue, faithfulCompletion{
+	// Enqueue to the owner's queue (real broker partition model).
+	owner := entry.owner
+	b.queues[owner] = append(b.queues[owner], faithfulCompletion{
 		Handle:   body.Handle,
 		Metadata: entry.metadata,
 		Result:   body.Result,
@@ -352,13 +356,14 @@ func (b *faithfulBroker) handleListCompleted(w http.ResponseWriter, r *http.Requ
 
 	b.listCompletedBodies = append(b.listCompletedBodies, reqBody)
 
-	// Return up to Max items (simplified — no peek-and-lock for simplicity;
-	// the ack handler removes items from the queue).
+	// Return up to Max items from the owner's queue only.
+	// This enforces real broker partitioning: a "ts" drain cannot see "go" completions.
+	ownerQueue := b.queues[reqBody.Owner]
 	end := reqBody.Max
-	if end > len(b.queue) {
-		end = len(b.queue)
+	if end > len(ownerQueue) {
+		end = len(ownerQueue)
 	}
-	out := b.queue[:end]
+	out := ownerQueue[:end]
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(out); err != nil {
@@ -379,10 +384,12 @@ func (b *faithfulBroker) handleAck(w http.ResponseWriter, r *http.Request) {
 	defer b.mu.Unlock()
 
 	delete(b.registry, body.Handle)
-	for i, item := range b.queue {
-		if item.Handle == body.Handle {
-			b.queue = append(b.queue[:i], b.queue[i+1:]...)
-			break
+	for owner, queue := range b.queues {
+		for i, item := range queue {
+			if item.Handle == body.Handle {
+				b.queues[owner] = append(queue[:i], queue[i+1:]...)
+				break
+			}
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -412,6 +419,27 @@ func postCallback(t *testing.T, brokerURL, handle, nonce, terminalStatus, prURL 
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("postCallback: expected 204, got %d", resp.StatusCode)
 	}
+}
+
+// drainOwner calls POST /list-completed with the given owner and returns the
+// parsed completions slice. Used to verify partition isolation: a ts-owner drain
+// must not observe go-owner completions and vice versa.
+func drainOwner(t *testing.T, brokerURL, owner string) []faithfulCompletion {
+	t.Helper()
+	payload, err := json.Marshal(map[string]interface{}{"owner": owner, "max": 50, "lock_ms": 0})
+	if err != nil {
+		t.Fatalf("drainOwner: marshal: %v", err)
+	}
+	resp, err := http.Post(brokerURL+"/list-completed", "application/json", bytes.NewReader(payload)) //nolint:noctx
+	if err != nil {
+		t.Fatalf("drainOwner %s: POST /list-completed: %v", owner, err)
+	}
+	defer resp.Body.Close()
+	var out []faithfulCompletion
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("drainOwner %s: decode response: %v", owner, err)
+	}
+	return out
 }
 
 // ─── mock GitHub client ───────────────────────────────────────────────────────
@@ -790,6 +818,17 @@ func TestCoexistence(t *testing.T) {
 	}
 	postCallback(t, brokerSrv.URL, goHandle, nonce, "in_review", fakePRURL)
 	t.Logf("executor callback: handle=%s nonce=%s posted successfully", goHandle, nonce)
+
+	// ── A2 partition isolation: ts drain must not see go completions ───────
+	// The go completion is now in the "go" owner queue. A simulated ts-owner
+	// drain must return an empty list, proving the faithfulBroker partitions
+	// correctly (mirrors real broker owner-partitioned queues).
+	t.Log("assert A2 partition isolation: ts drain sees 0 go completions")
+	tsCompletions := drainOwner(t, brokerSrv.URL, "ts")
+	if len(tsCompletions) != 0 {
+		t.Errorf("A2 partition isolation FAIL: ts drain returned %d item(s), want 0 (go completions must not cross owner boundary)", len(tsCompletions))
+	}
+	t.Log("A2 partition isolation PASS: ts drain returned empty — go completions isolated to go queue")
 
 	// ── Cycle 2: reap the completion → task moves to in_review ────────────
 	t.Log("cycle 2: reap → in_review")
