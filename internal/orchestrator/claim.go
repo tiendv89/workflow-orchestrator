@@ -48,6 +48,23 @@ func ClaimTask(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uu
 	return true, nil
 }
 
+// RollbackClaim transitions a task from "in_progress" back to "ready" when
+// dispatch fails after a successful claim. This prevents the task from becoming
+// permanently orphaned — FindEligibleTasks only selects "ready" tasks, so
+// without rollback the task would be stuck forever.
+//
+// Returns:
+//   - (true, nil)  — rollback succeeded; the task is ready again.
+//   - (false, nil) — the task was no longer in_progress (e.g. already claimed by another); not an error.
+//   - (false, err) — a database error occurred.
+func RollbackClaim(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error) {
+	ok, err := GuardedTransition(ctx, pool, workspaceID, taskUUID, "in_progress", "ready", nil)
+	if err != nil {
+		return false, fmt.Errorf("RollbackClaim: %w", err)
+	}
+	return ok, nil
+}
+
 // buildExecution constructs the JSON execution payload for the claim.
 func buildExecution(executorID string) ([]byte, error) {
 	payload := map[string]string{

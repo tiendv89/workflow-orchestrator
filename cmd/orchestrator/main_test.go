@@ -73,6 +73,9 @@ func fixedHandleLC(
 		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _ string) (bool, error) {
 			return claimWon, claimErr
 		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			return true, nil
+		},
 		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, handle string) error {
 			if handles != nil {
 				*handles = append(*handles, handle)
@@ -117,6 +120,9 @@ func TestRunCycle_FindEligibleError(t *testing.T) {
 		},
 		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _ string) (bool, error) {
 			return false, nil
+		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			return true, nil
 		},
 		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {
 			return nil
@@ -180,6 +186,9 @@ func TestRunCycle_ClaimLost(t *testing.T) {
 		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _ string) (bool, error) {
 			return false, nil // claim lost
 		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			return true, nil
+		},
 		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, handle string) error {
 			dispatchCalled = true
 			return nil
@@ -226,12 +235,18 @@ func TestRunCycle_DispatchError(t *testing.T) {
 
 	var usedHandle string
 
+	var rollbackCalled bool
+
 	lc := loopConfig{
 		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
 			return []db.WorkspaceTask{task}, nil
 		},
 		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _ string) (bool, error) {
 			return true, nil // claim won
+		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			rollbackCalled = true
+			return true, nil
 		},
 		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, handle string) error {
 			usedHandle = handle
@@ -250,6 +265,9 @@ func TestRunCycle_DispatchError(t *testing.T) {
 
 	if _, ok := hs.Lookup(usedHandle); ok {
 		t.Errorf("handle %q should not be registered after dispatch error", usedHandle)
+	}
+	if !rollbackCalled {
+		t.Error("expected RollbackClaim to be called after dispatch error")
 	}
 }
 
@@ -276,6 +294,9 @@ func TestRunCycle_HappyPath(t *testing.T) {
 			return []db.WorkspaceTask{task}, nil
 		},
 		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _ string) (bool, error) {
+			return true, nil
+		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
 			return true, nil
 		},
 		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {

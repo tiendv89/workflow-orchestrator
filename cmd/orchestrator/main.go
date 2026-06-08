@@ -58,7 +58,7 @@ func main() {
 	hs := orchestrator.NewHandleStore()
 	ghClient := gh.NewClient(cfg.GitHubToken)
 
-	go serveHealthz()
+	go serveHealthz(ctx)
 
 	executorID := fmt.Sprintf("go-orchestrator/%s", cfg.WorkspaceID)
 
@@ -73,6 +73,9 @@ func main() {
 		},
 		claimTask: func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, executor string) (bool, error) {
 			return orchestrator.ClaimTask(ctx, pool, wsID, taskID, executor)
+		},
+		rollbackClaim: func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID) (bool, error) {
+			return orchestrator.RollbackClaim(ctx, pool, wsID, taskID)
 		},
 		dispatch: func(ctx context.Context, c *config.Config, task db.WorkspaceTask, handle string) error {
 			return dispatcher.Dispatch(ctx, c, task, handle)
@@ -108,6 +111,7 @@ func main() {
 type loopConfig struct {
 	findEligible  func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
 	claimTask     func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, executor string) (bool, error)
+	rollbackClaim func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID) (bool, error)
 	dispatch      func(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error
 	reapCompleted func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, hs *orchestrator.HandleStore) error
 	pollMergedPRs func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error
@@ -146,7 +150,10 @@ func runCycle(
 			}
 
 			if dispatchErr := lc.dispatch(ctx, cfg, task, handle); dispatchErr != nil {
-				log.Error().Err(dispatchErr).Str("task", task.TaskName).Msg("poll: Dispatch error")
+				log.Error().Err(dispatchErr).Str("task", task.TaskName).Msg("poll: Dispatch error — rolling back claim")
+				if _, rbErr := lc.rollbackClaim(ctx, pool, workspaceID, task.TaskID); rbErr != nil {
+					log.Error().Err(rbErr).Str("task", task.TaskName).Msg("poll: RollbackClaim error — task may be stuck in in_progress")
+				}
 				continue
 			}
 
@@ -180,7 +187,8 @@ func runCycle(
 
 // serveHealthz starts a minimal HTTP server that returns 200 OK on /healthz.
 // Used by docker-compose health checks to confirm the orchestrator is running.
-func serveHealthz() {
+// When ctx is cancelled the listener is shut down cleanly.
+func serveHealthz(ctx context.Context) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -192,6 +200,10 @@ func serveHealthz() {
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
 	}
+	go func() {
+		<-ctx.Done()
+		_ = srv.Shutdown(context.Background())
+	}()
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal().Err(err).Msg("healthz server error")
 	}
