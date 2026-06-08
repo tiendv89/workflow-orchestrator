@@ -47,6 +47,7 @@ func newTestConfig(brokerURL string) *config.Config {
 		BrokerURL:      brokerURL,
 		ManagementRepo: "owner/repo",
 		BaseBranch:     "main",
+		ImplRepoURL:    "git@github.com:owner/impl-repo.git",
 	}
 }
 
@@ -60,6 +61,7 @@ func newTestTask() db.WorkspaceTask {
 
 // TestDispatch_BrokerRegistration verifies that dispatch POSTs the correct JSON
 // body to /register and returns nil when the broker responds 200.
+// Asserts snake_case metadata keys, nonce presence, and owner="go".
 func TestDispatch_BrokerRegistration(t *testing.T) {
 	var capturedBody brokerRegisterRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +92,9 @@ func TestDispatch_BrokerRegistration(t *testing.T) {
 	if capturedBody.Owner != "go" {
 		t.Errorf("owner = %q, want go", capturedBody.Owner)
 	}
+	if capturedBody.Nonce == "" {
+		t.Error("nonce must not be empty")
+	}
 	if capturedBody.Metadata.FeatureID != "my-feature" {
 		t.Errorf("FeatureID = %q, want my-feature", capturedBody.Metadata.FeatureID)
 	}
@@ -102,11 +107,59 @@ func TestDispatch_BrokerRegistration(t *testing.T) {
 	if capturedBody.Metadata.StartedAt == "" {
 		t.Error("StartedAt must not be empty")
 	}
+	if capturedBody.Metadata.Kind != "impl" {
+		t.Errorf("Kind = %q, want impl", capturedBody.Metadata.Kind)
+	}
 }
 
-// TestDispatch_RedisStreamEntry verifies that dispatch calls StreamAdd with the
-// correct stream name and ABI fields.
-func TestDispatch_RedisStreamEntry(t *testing.T) {
+// TestDispatch_NonceConsistency verifies that the nonce on /register matches
+// the nonce embedded in the dispatched DispatchJob on the stream.
+func TestDispatch_NonceConsistency(t *testing.T) {
+	var registeredNonce string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/register" {
+			var body brokerRegisterRequest
+			body2, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(body2, &body)
+			registeredNonce = body.Nonce
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ms := &mockStreamer{}
+	d := NewDispatcher(srv.URL, ms, srv.Client())
+	cfg := newTestConfig(srv.URL)
+	task := newTestTask()
+
+	if err := d.Dispatch(context.Background(), cfg, task, "handle-nonce-check"); err != nil {
+		t.Fatalf("dispatch returned error: %v", err)
+	}
+
+	if registeredNonce == "" {
+		t.Fatal("no nonce captured from /register call")
+	}
+
+	if len(ms.calls) != 1 {
+		t.Fatalf("StreamAdd called %d times, want 1", len(ms.calls))
+	}
+
+	jobJSON := ms.calls[0].values["job"]
+	if jobJSON == "" {
+		t.Fatal("stream entry missing 'job' field")
+	}
+	var job dispatchJob
+	if err := json.Unmarshal([]byte(jobJSON), &job); err != nil {
+		t.Fatalf("parse job JSON: %v", err)
+	}
+	if job.Nonce != registeredNonce {
+		t.Errorf("job.Nonce = %q, want %q (registered nonce)", job.Nonce, registeredNonce)
+	}
+}
+
+// TestDispatch_StreamEntry verifies that dispatch calls StreamAdd with a single
+// "job" field containing a parseable DispatchJob with all required ABI fields.
+func TestDispatch_StreamEntry(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -129,19 +182,95 @@ func TestDispatch_RedisStreamEntry(t *testing.T) {
 		t.Errorf("stream = %q, want platform:dispatch", call.stream)
 	}
 
-	check := func(key, want string) {
-		t.Helper()
-		if got := call.values[key]; got != want {
-			t.Errorf("values[%q] = %q, want %q", key, got, want)
+	// The stream entry must have exactly one field: "job".
+	jobJSON, ok := call.values["job"]
+	if !ok || jobJSON == "" {
+		t.Fatalf("stream entry missing 'job' field; got fields: %v", call.values)
+	}
+
+	// The "job" field must parse as a valid DispatchJob.
+	var job dispatchJob
+	if err := json.Unmarshal([]byte(jobJSON), &job); err != nil {
+		t.Fatalf("'job' field is not valid JSON: %v", err)
+	}
+
+	// Verify all required ABI fields.
+	if job.Handle != "handle-xyz" {
+		t.Errorf("job.Handle = %q, want handle-xyz", job.Handle)
+	}
+	if job.Nonce == "" {
+		t.Error("job.Nonce must not be empty")
+	}
+	if job.Kind != "impl" {
+		t.Errorf("job.Kind = %q, want impl", job.Kind)
+	}
+	if job.TaskID != "T11" {
+		t.Errorf("job.TaskID = %q, want T11", job.TaskID)
+	}
+	if job.FeatureID != "my-feature" {
+		t.Errorf("job.FeatureID = %q, want my-feature", job.FeatureID)
+	}
+	if job.WorkspaceID != "ws-123" {
+		t.Errorf("job.WorkspaceID = %q, want ws-123", job.WorkspaceID)
+	}
+	if job.TaskRepoURL != "git@github.com:owner/impl-repo.git" {
+		t.Errorf("job.TaskRepoURL = %q, want git@github.com:owner/impl-repo.git", job.TaskRepoURL)
+	}
+	if job.TaskRepoBranch != "feature/my-feature-T11" {
+		t.Errorf("job.TaskRepoBranch = %q, want feature/my-feature-T11", job.TaskRepoBranch)
+	}
+	if job.MgmtRepoURL != "owner/repo" {
+		t.Errorf("job.MgmtRepoURL = %q, want owner/repo", job.MgmtRepoURL)
+	}
+	if job.CallbackURL != srv.URL+"/callback" {
+		t.Errorf("job.CallbackURL = %q, want %s/callback", job.CallbackURL, srv.URL)
+	}
+	if job.EnqueuedAt == "" {
+		t.Error("job.EnqueuedAt must not be empty")
+	}
+}
+
+// TestDispatch_MetadataSnakeCaseRoundTrip verifies that handleMetadata JSON
+// tags are snake_case, so broker decoding of "feature_id"/"task_id" works.
+func TestDispatch_MetadataSnakeCaseRoundTrip(t *testing.T) {
+	meta := handleMetadata{
+		Kind:      "impl",
+		FeatureID: "my-feature",
+		TaskID:    "T11",
+		TenantID:  "tenant-1",
+		StartedAt: "2026-06-08T00:00:00Z",
+	}
+
+	b, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// Verify the marshalled JSON uses snake_case keys.
+	var raw map[string]string
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatalf("unmarshal to map: %v", err)
+	}
+	for _, key := range []string{"kind", "feature_id", "task_id", "tenant_id", "started_at"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("JSON key %q missing; keys present: %v", key, raw)
 		}
 	}
-	check("task_id", "T11")
-	check("feature_id", "my-feature")
-	check("workspace_id", "ws-123")
-	check("handle", "handle-xyz")
-	check("management_repo", "owner/repo")
-	check("base_branch", "main")
-	check("branch", "feature/my-feature-T11")
+
+	// Round-trip: decode back into a struct.
+	var decoded handleMetadata
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatalf("round-trip unmarshal: %v", err)
+	}
+	if decoded.FeatureID != meta.FeatureID {
+		t.Errorf("FeatureID round-trip: got %q, want %q", decoded.FeatureID, meta.FeatureID)
+	}
+	if decoded.TaskID != meta.TaskID {
+		t.Errorf("TaskID round-trip: got %q, want %q", decoded.TaskID, meta.TaskID)
+	}
+	if decoded.Kind != meta.Kind {
+		t.Errorf("Kind round-trip: got %q, want %q", decoded.Kind, meta.Kind)
+	}
 }
 
 // TestDispatch_BrokerError verifies that a non-200 broker response returns an error.
