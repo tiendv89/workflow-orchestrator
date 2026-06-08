@@ -7,9 +7,22 @@ import (
 	"github.com/tiendv89/workflow-orchestrator/internal/config"
 )
 
+func setAllRequired(t *testing.T) {
+	t.Helper()
+	t.Setenv("DATABASE_URL", "postgres://localhost/test")
+	t.Setenv("WORKSPACE_ID", "11111111-0000-0000-0000-000000000000")
+	t.Setenv("ORGANIZATION_ID", "22222222-0000-0000-0000-000000000000")
+	t.Setenv("BROKER_URL", "http://localhost:8080")
+	t.Setenv("GITHUB_TOKEN", "ghp_test")
+	t.Setenv("REDIS_URL", "localhost:6379")
+	t.Setenv("MANAGEMENT_REPO", "tiendv89/project-workspace")
+}
+
 func TestLoad_MissingRequired(t *testing.T) {
-	// Clear all required env vars.
-	vars := []string{"DATABASE_URL", "WORKSPACE_ID", "ORGANIZATION_ID", "BROKER_URL", "GITHUB_TOKEN"}
+	vars := []string{
+		"DATABASE_URL", "WORKSPACE_ID", "ORGANIZATION_ID",
+		"BROKER_URL", "GITHUB_TOKEN", "REDIS_URL", "MANAGEMENT_REPO",
+	}
 	for _, v := range vars {
 		t.Setenv(v, "")
 	}
@@ -21,11 +34,7 @@ func TestLoad_MissingRequired(t *testing.T) {
 }
 
 func TestLoad_AllPresent(t *testing.T) {
-	t.Setenv("DATABASE_URL", "postgres://localhost/test")
-	t.Setenv("WORKSPACE_ID", "11111111-0000-0000-0000-000000000000")
-	t.Setenv("ORGANIZATION_ID", "22222222-0000-0000-0000-000000000000")
-	t.Setenv("BROKER_URL", "http://localhost:8080")
-	t.Setenv("GITHUB_TOKEN", "ghp_test")
+	setAllRequired(t)
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -37,14 +46,29 @@ func TestLoad_AllPresent(t *testing.T) {
 	if cfg.PollIntervalSeconds != 15 {
 		t.Errorf("PollIntervalSeconds default = %d, want 15", cfg.PollIntervalSeconds)
 	}
+	if cfg.BaseBranch != "main" {
+		t.Errorf("BaseBranch default = %q, want main", cfg.BaseBranch)
+	}
+	if cfg.ManagementRepo != "tiendv89/project-workspace" {
+		t.Errorf("ManagementRepo = %q", cfg.ManagementRepo)
+	}
+}
+
+func TestLoad_BaseBranchOverride(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("BASE_BRANCH", "develop")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.BaseBranch != "develop" {
+		t.Errorf("BaseBranch = %q, want develop", cfg.BaseBranch)
+	}
 }
 
 func TestLoad_PollIntervalOverride(t *testing.T) {
-	t.Setenv("DATABASE_URL", "postgres://localhost/test")
-	t.Setenv("WORKSPACE_ID", "11111111-0000-0000-0000-000000000000")
-	t.Setenv("ORGANIZATION_ID", "22222222-0000-0000-0000-000000000000")
-	t.Setenv("BROKER_URL", "http://localhost:8080")
-	t.Setenv("GITHUB_TOKEN", "ghp_test")
+	setAllRequired(t)
 	t.Setenv("POLL_INTERVAL_SECONDS", "30")
 
 	cfg, err := config.Load()
@@ -57,11 +81,7 @@ func TestLoad_PollIntervalOverride(t *testing.T) {
 }
 
 func TestLoad_InvalidPollInterval(t *testing.T) {
-	t.Setenv("DATABASE_URL", "postgres://localhost/test")
-	t.Setenv("WORKSPACE_ID", "11111111-0000-0000-0000-000000000000")
-	t.Setenv("ORGANIZATION_ID", "22222222-0000-0000-0000-000000000000")
-	t.Setenv("BROKER_URL", "http://localhost:8080")
-	t.Setenv("GITHUB_TOKEN", "ghp_test")
+	setAllRequired(t)
 	t.Setenv("POLL_INTERVAL_SECONDS", "not-a-number")
 
 	_, err := config.Load()
@@ -71,12 +91,13 @@ func TestLoad_InvalidPollInterval(t *testing.T) {
 }
 
 func TestLoad_PartialMissing(t *testing.T) {
-	// Only set some vars; others are missing.
 	os.Unsetenv("DATABASE_URL")
 	os.Unsetenv("WORKSPACE_ID")
 	t.Setenv("ORGANIZATION_ID", "22222222-0000-0000-0000-000000000000")
 	t.Setenv("BROKER_URL", "http://localhost:8080")
 	t.Setenv("GITHUB_TOKEN", "ghp_test")
+	t.Setenv("REDIS_URL", "localhost:6379")
+	t.Setenv("MANAGEMENT_REPO", "tiendv89/project-workspace")
 
 	_, err := config.Load()
 	if err == nil {
