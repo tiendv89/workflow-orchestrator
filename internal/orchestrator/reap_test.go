@@ -359,3 +359,62 @@ func TestReap_BrokerError(t *testing.T) {
 		t.Fatal("expected error for non-200 broker response, got nil")
 	}
 }
+
+// TestReap_SnakeCaseMetadataDecode verifies that the broker's snake_case JSON
+// metadata keys (feature_id, task_id) are decoded correctly into completionRecord.
+// This tests the slow-path: metadata slugs are used to resolve the task when the
+// handle is absent from the in-memory HandleStore (e.g. after an orchestrator restart).
+func TestReap_SnakeCaseMetadataDecode(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	// The broker returns snake_case JSON — matching store.HandleMetadata tags.
+	rawCompletion := `[{
+		"handle": "handle-snake",
+		"metadata": {
+			"kind": "impl",
+			"feature_id": "snake-feature",
+			"task_id": "T42",
+			"started_at": "2026-06-08T00:00:00Z"
+		},
+		"result": {
+			"terminal_status": "in_review",
+			"pr_url": "https://github.com/owner/repo/pull/10"
+		}
+	}]`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(rawCompletion))
+	}))
+	defer srv.Close()
+
+	resolvedEntry := &HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "snake-feature",
+		TaskName:    "T42",
+	}
+	ft := &fakeTransition{slowLookupResult: resolvedEntry}
+	hs := NewHandleStore() // empty — forces slow path using Metadata slugs
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	// Verify the slow-path lookup was called with the snake_case-decoded slugs.
+	if len(ft.inReviewCalls) != 1 {
+		t.Fatalf("SetInReview called %d times, want 1", len(ft.inReviewCalls))
+	}
+	if ft.inReviewCalls[0].taskUUID != taskUUID {
+		t.Errorf("taskUUID = %v, want %v", ft.inReviewCalls[0].taskUUID, taskUUID)
+	}
+	if ft.inReviewCalls[0].prURL != "https://github.com/owner/repo/pull/10" {
+		t.Errorf("prURL = %q", ft.inReviewCalls[0].prURL)
+	}
+}

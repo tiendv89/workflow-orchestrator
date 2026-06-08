@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/tiendv89/workflow-orchestrator/internal/config"
 	db "github.com/tiendv89/workflow-orchestrator/internal/database/queries"
@@ -38,18 +39,40 @@ func (r *redisStreamer) StreamAdd(ctx context.Context, stream string, values map
 	return r.rdb.XAdd(ctx, args).Err()
 }
 
+// handleMetadata represents the broker's HandleMetadata.
+// JSON tags are snake_case to match agent-workflow/runtime/broker/internal/store/store.go:18-23.
+type handleMetadata struct {
+	Kind      string `json:"kind"`
+	TaskID    string `json:"task_id"`
+	FeatureID string `json:"feature_id"`
+	TenantID  string `json:"tenant_id,omitempty"`
+	StartedAt string `json:"started_at"`
+}
+
 // brokerRegisterRequest is the JSON body for POST /register.
 type brokerRegisterRequest struct {
 	Handle   string         `json:"handle"`
-	Owner    string         `json:"owner"`
+	Nonce    string         `json:"nonce"`
+	Owner    string         `json:"owner,omitempty"`
 	Metadata handleMetadata `json:"metadata"`
 }
 
-type handleMetadata struct {
-	FeatureID string `json:"FeatureID"`
-	TaskID    string `json:"TaskID"`
-	TenantID  string `json:"TenantID"`
-	StartedAt string `json:"StartedAt"`
+// dispatchJob is the payload marshalled as the single "job" field on the Redis dispatch stream.
+// It mirrors DispatchJob in agent-workflow/runtime/abi/src/types.ts:50-96.
+type dispatchJob struct {
+	Handle             string `json:"handle"`
+	Nonce              string `json:"nonce"`
+	Kind               string `json:"kind"`
+	TaskID             string `json:"task_id"`
+	FeatureID          string `json:"feature_id"`
+	WorkspaceID        string `json:"workspace_id"`
+	TaskRepoURL        string `json:"task_repo_url"`
+	TaskRepoBranch     string `json:"task_repo_branch"`
+	TaskBaseBranch     string `json:"task_base_branch"`
+	TaskRepoBaseBranch string `json:"task_repo_base_branch"`
+	MgmtRepoURL        string `json:"mgmt_repo_url"`
+	CallbackURL        string `json:"callback_url"`
+	EnqueuedAt         string `json:"enqueued_at"`
 }
 
 // Dispatcher handles broker registration and Redis stream enqueuing for a task.
@@ -69,27 +92,30 @@ func NewDispatcher(brokerURL string, stream Streamer, httpClient *http.Client) *
 }
 
 // Dispatch registers the handle with the broker and enqueues the DispatchJob.
-// The Dispatcher (and its underlying Streamer/Redis client) must be created once
-// at startup and shared across calls to avoid connection leaks.
+// A single-use nonce is generated here and threaded through both the /register
+// call and the stream entry so the executor's /callback validates correctly.
 func (d *Dispatcher) Dispatch(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error {
+	nonce := uuid.New().String()
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	if err := d.registerHandle(ctx, handle, task, cfg.OrganizationID, now); err != nil {
+	if err := d.registerHandle(ctx, handle, task, cfg.OrganizationID, nonce, now); err != nil {
 		return fmt.Errorf("dispatch: broker register: %w", err)
 	}
 
-	if err := d.enqueueJob(ctx, cfg, task, handle); err != nil {
+	if err := d.enqueueJob(ctx, cfg, task, handle, nonce, now); err != nil {
 		return fmt.Errorf("dispatch: enqueue job: %w", err)
 	}
 
 	return nil
 }
 
-func (d *Dispatcher) registerHandle(ctx context.Context, handle string, task db.WorkspaceTask, tenantID, startedAt string) error {
+func (d *Dispatcher) registerHandle(ctx context.Context, handle string, task db.WorkspaceTask, tenantID, nonce, startedAt string) error {
 	body := brokerRegisterRequest{
 		Handle: handle,
+		Nonce:  nonce,
 		Owner:  "go",
 		Metadata: handleMetadata{
+			Kind:      "impl",
 			FeatureID: task.FeatureName,
 			TaskID:    task.TaskName,
 			TenantID:  tenantID,
@@ -122,21 +148,34 @@ func (d *Dispatcher) registerHandle(ctx context.Context, handle string, task db.
 	return nil
 }
 
-func (d *Dispatcher) enqueueJob(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error {
+func (d *Dispatcher) enqueueJob(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle, nonce, now string) error {
 	branch := ""
 	if task.Branch != nil {
 		branch = *task.Branch
 	}
 
-	values := map[string]string{
-		"task_id":         task.TaskName,
-		"feature_id":      task.FeatureName,
-		"workspace_id":    cfg.WorkspaceID,
-		"handle":          handle,
-		"management_repo": cfg.ManagementRepo,
-		"base_branch":     cfg.BaseBranch,
-		"branch":          branch,
+	job := dispatchJob{
+		Handle:             handle,
+		Nonce:              nonce,
+		Kind:               "impl",
+		TaskID:             task.TaskName,
+		FeatureID:          task.FeatureName,
+		WorkspaceID:        cfg.WorkspaceID,
+		TaskRepoURL:        cfg.ImplRepoURL,
+		TaskRepoBranch:     branch,
+		TaskBaseBranch:     cfg.BaseBranch,
+		TaskRepoBaseBranch: cfg.BaseBranch,
+		MgmtRepoURL:        cfg.ManagementRepo,
+		CallbackURL:        cfg.BrokerURL + "/callback",
+		EnqueuedAt:         now,
 	}
 
-	return d.stream.StreamAdd(ctx, "platform:dispatch", values)
+	payload, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("marshal dispatch job: %w", err)
+	}
+
+	return d.stream.StreamAdd(ctx, "platform:dispatch", map[string]string{
+		"job": string(payload),
+	})
 }

@@ -17,6 +17,7 @@ type Config struct {
 	RedisURL            string
 	ManagementRepo      string
 	BaseBranch          string
+	ImplRepoURL         string
 	PollIntervalSeconds int
 }
 
@@ -38,6 +39,8 @@ func Load() (*Config, error) {
 	if cfg.BaseBranch == "" {
 		cfg.BaseBranch = "main"
 	}
+
+	cfg.ImplRepoURL = os.Getenv("IMPL_REPO_URL")
 
 	cfg.PollIntervalSeconds = 15
 	if raw := os.Getenv("POLL_INTERVAL_SECONDS"); raw != "" {

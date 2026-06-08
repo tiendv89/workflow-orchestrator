@@ -183,6 +183,7 @@ func dbLookupTaskBySlug(
 	err := pool.QueryRow(ctx,
 		`SELECT feature_id, task_id FROM workspace_tasks
 		 WHERE workspace_id = $1 AND feature_name = $2 AND task_name = $3
+		   AND owner = 'go'
 		 LIMIT 1`,
 		workspaceID, featureName, taskName,
 	).Scan(&featureUUID, &taskUUID)
