@@ -334,9 +334,10 @@ func listFeaturesForWorkspace(
 	return ids
 }
 
-// simulateSyncCycle simulates what the T2 sync adapter does: it touches only
-// rows where owner IS NULL and leaves go-owned rows untouched.  We verify A4
-// by confirming the go feature row survives a hypothetical sync deletion pass.
+// simulateSyncCycle simulates a T2 sync adapter reconciliation pass that
+// removes all null-owner rows (stale YAML-sourced rows not found in YAML).
+// go-owned rows (owner = 'go') must survive because the T2 adapter scopes
+// its DELETE to owner IS NULL.  This is the real invariant tested by A4.
 func simulateSyncCycle(
 	t *testing.T,
 	ctx context.Context,
@@ -344,11 +345,11 @@ func simulateSyncCycle(
 	wsID uuid.UUID,
 ) {
 	t.Helper()
-	// The sync adapter deletes stale YAML-sourced features.  It must scope its
-	// DELETE to owner IS NULL so it never touches go-owned rows.
+	// Mirror the actual T2 adapter scope: delete all null-owner tasks so that
+	// a buggy adapter that accidentally targets go rows would fail A4.
 	_, err := pool.Exec(ctx,
 		`DELETE FROM workspace_tasks
-		 WHERE workspace_id = $1 AND owner IS NULL AND false`, // predicate always false — no-op
+		 WHERE workspace_id = $1 AND (owner IS NULL OR owner = '')`,
 		wsID,
 	)
 	if err != nil {
@@ -356,13 +357,12 @@ func simulateSyncCycle(
 	}
 	_, err = pool.Exec(ctx,
 		`DELETE FROM workspace_features
-		 WHERE workspace_id = $1 AND owner IS NULL AND false`,
+		 WHERE workspace_id = $1 AND (owner IS NULL OR owner = '')`,
 		wsID,
 	)
 	if err != nil {
 		t.Fatalf("simulateSyncCycle feature delete: %v", err)
 	}
-	// Real sync: scope to owner IS NULL only — go rows must survive.
 }
 
 // ─── poll cycle helpers ───────────────────────────────────────────────────────
@@ -623,19 +623,8 @@ func TestCoexistence(t *testing.T) {
 	}
 	t.Log("A3 PASS: go orchestrator only requested go-owner completions")
 
-	// ── A4: sync cycle does not delete go rows ─────────────────────────────
-	t.Log("assert A4: sync cycle leaves go rows intact")
-	simulateSyncCycle(t, ctx, pool, wsID)
-	if !featureExists(t, ctx, pool, wsID, goFeatureID) {
-		t.Error("A4 FAIL: go feature was deleted by sync cycle")
-	}
-	// Verify the go task also survives.
-	if status := getTaskStatus(t, ctx, pool, wsID, goTaskID); status == "" {
-		t.Error("A4 FAIL: go task was deleted by sync cycle")
-	}
-	t.Log("A4 PASS: go feature and tasks survived sync cycle")
-
 	// ── A5: both features visible via read API (DB query surrogate) ─────────
+	// Checked before the sync cycle so both go and ts rows are still present.
 	t.Log("assert A5: both features visible in workspace")
 	visibleFeatures := listFeaturesForWorkspace(t, ctx, pool, wsID)
 	foundGo, foundTS := false, false
@@ -656,6 +645,8 @@ func TestCoexistence(t *testing.T) {
 	t.Log("A5 PASS: both features surface in workspace query")
 
 	// ── A6: ts feature lifecycle unaffected ────────────────────────────────
+	// Checked before the sync cycle; verifies the go orchestrator did not
+	// mutate ts rows during its poll cycles.
 	t.Log("assert A6: ts feature task status unchanged")
 	currentTSStatus := getTaskStatus(t, ctx, pool, wsID, tsTaskID)
 	if currentTSStatus != initialTSStatus {
@@ -675,4 +666,20 @@ func TestCoexistence(t *testing.T) {
 		t.Errorf("A6 FAIL: ts feature owner changed from null to %q", *tsOwner)
 	}
 	t.Log("A6 PASS: ts feature and task unmodified by go orchestrator")
+
+	// ── A4: sync cycle does not delete go rows ─────────────────────────────
+	// simulateSyncCycle runs real DELETEs targeting owner IS NULL — mirroring
+	// the T2 adapter.  go-owned rows must survive because they have owner='go'.
+	// A buggy adapter that accidentally targets go rows would fail here.
+	// Note: this destroys the ts rows, so A5/A6 run first (above).
+	t.Log("assert A4: sync cycle leaves go rows intact")
+	simulateSyncCycle(t, ctx, pool, wsID)
+	if !featureExists(t, ctx, pool, wsID, goFeatureID) {
+		t.Error("A4 FAIL: go feature was deleted by sync cycle")
+	}
+	// Verify the go task also survives.
+	if status := getTaskStatus(t, ctx, pool, wsID, goTaskID); status == "" {
+		t.Error("A4 FAIL: go task was deleted by sync cycle")
+	}
+	t.Log("A4 PASS: go feature and tasks survived sync cycle")
 }
