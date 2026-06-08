@@ -117,7 +117,7 @@ func TestReap_GoCompletion_InReview(t *testing.T) {
 			t.Errorf("owner param = %q, want go", r.URL.Query().Get("owner"))
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(makeCompletionResponse([]completionRecord{completion}))
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
 	}))
 	defer srv.Close()
 
@@ -184,7 +184,7 @@ func TestReap_GoCompletion_Blocked(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(makeCompletionResponse([]completionRecord{completion}))
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
 	}))
 	defer srv.Close()
 
@@ -238,7 +238,7 @@ func TestReap_UnknownHandle(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(makeCompletionResponse([]completionRecord{completion}))
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
 	}))
 	defer srv.Close()
 
@@ -282,7 +282,7 @@ func TestReap_SlowPathResolution(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(makeCompletionResponse([]completionRecord{completion}))
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
 	}))
 	defer srv.Close()
 
@@ -315,7 +315,7 @@ func TestReap_SlowPathResolution(t *testing.T) {
 func TestReap_EmptyQueue(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte("[]"))
+		_, _ = w.Write([]byte("[]"))
 	}))
 	defer srv.Close()
 
