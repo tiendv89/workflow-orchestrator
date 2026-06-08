@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -89,21 +90,53 @@ func main() {
 		newHandle: uuid.New,
 	}
 
-	ticker := time.NewTicker(time.Duration(cfg.PollIntervalSeconds) * time.Second)
-	defer ticker.Stop()
+	ps := newPollState(cfg.PollIntervalSeconds)
 
-	// Run the first cycle immediately before waiting for the first tick.
-	runCycle(ctx, cfg, pool, workspaceID, hs, executorID, lc)
+	// Run the first cycle immediately before the first backoff sleep.
+	hadError := runCycle(ctx, cfg, pool, workspaceID, hs, executorID, lc)
 
 	for {
+		sleep := ps.next(hadError)
+		log.Debug().Dur("sleep_ms", sleep).Msg("poll: sleeping before next cycle")
 		select {
 		case <-ctx.Done():
 			log.Info().Msg("orchestrator shutting down")
 			return
-		case <-ticker.C:
-			runCycle(ctx, cfg, pool, workspaceID, hs, executorID, lc)
+		case <-time.After(sleep):
 		}
+		hadError = runCycle(ctx, cfg, pool, workspaceID, hs, executorID, lc)
 	}
+}
+
+// pollState tracks the current backoff interval for the poll loop. On
+// consecutive errors the interval doubles up to maxBackoff; on success it
+// resets to base. A ±20% jitter is applied each call to spread load.
+type pollState struct {
+	base       time.Duration
+	maxBackoff time.Duration
+	current    time.Duration
+}
+
+func newPollState(intervalSecs int) pollState {
+	base := time.Duration(intervalSecs) * time.Second
+	return pollState{
+		base:       base,
+		maxBackoff: 5 * base,
+		current:    base,
+	}
+}
+
+// next returns the next sleep duration and updates internal state. On error
+// the interval doubles (capped at maxBackoff); on success it resets to base.
+// A uniform ±20% jitter is applied to prevent thundering-herd across instances.
+func (s *pollState) next(hadError bool) time.Duration {
+	if hadError {
+		s.current = min(s.current*2, s.maxBackoff)
+	} else {
+		s.current = s.base
+	}
+	factor := 0.8 + rand.Float64()*0.4 //nolint:gosec // non-cryptographic jitter
+	return time.Duration(float64(s.current) * factor)
 }
 
 // loopConfig holds injectable functions for each step of the poll cycle.
@@ -119,7 +152,8 @@ type loopConfig struct {
 }
 
 // runCycle executes one full poll iteration. Each step's errors are logged and
-// do not crash the loop — the next cycle will retry.
+// do not crash the loop — the next cycle will retry. Returns true if any step
+// encountered an error (used by the caller to drive backoff).
 func runCycle(
 	ctx context.Context,
 	cfg *config.Config,
@@ -128,13 +162,15 @@ func runCycle(
 	hs *orchestrator.HandleStore,
 	executorID string,
 	lc loopConfig,
-) {
+) bool {
 	log.Debug().Msg("poll cycle start")
+	hadError := false
 
 	// Step a: find eligible tasks and claim + dispatch each.
 	tasks, err := lc.findEligible(ctx, pool, workspaceID)
 	if err != nil {
 		log.Error().Err(err).Msg("poll: FindEligibleTasks")
+		hadError = true
 	} else {
 		for _, task := range tasks {
 			handle := lc.newHandle().String()
@@ -142,6 +178,7 @@ func runCycle(
 			won, claimErr := lc.claimTask(ctx, pool, workspaceID, task.TaskID, executorID)
 			if claimErr != nil {
 				log.Error().Err(claimErr).Str("task", task.TaskName).Msg("poll: ClaimTask error")
+				hadError = true
 				continue
 			}
 			if !won {
@@ -151,6 +188,7 @@ func runCycle(
 
 			if dispatchErr := lc.dispatch(ctx, cfg, task, handle); dispatchErr != nil {
 				log.Error().Err(dispatchErr).Str("task", task.TaskName).Msg("poll: Dispatch error — rolling back claim")
+				hadError = true
 				if _, rbErr := lc.rollbackClaim(ctx, pool, workspaceID, task.TaskID); rbErr != nil {
 					log.Error().Err(rbErr).Str("task", task.TaskName).Msg("poll: RollbackClaim error — task may be stuck in in_progress")
 				}
@@ -175,27 +213,36 @@ func runCycle(
 	// Step b: reap completed tasks from the broker.
 	if err := lc.reapCompleted(ctx, cfg, pool, hs); err != nil {
 		log.Error().Err(err).Msg("poll: ReapCompleted error")
+		hadError = true
 	}
 
 	// Step c: poll GitHub for merged PRs.
 	if err := lc.pollMergedPRs(ctx, pool, workspaceID); err != nil {
 		log.Error().Err(err).Msg("poll: PollMergedPRs error")
+		hadError = true
 	}
 
 	log.Debug().Msg("poll cycle complete")
+	return hadError
 }
 
-// serveHealthz starts a minimal HTTP server that returns 200 OK on /healthz.
-// Used by docker-compose health checks to confirm the orchestrator is running.
-// When ctx is cancelled the listener is shut down cleanly.
+// serveHealthz starts a minimal HTTP server on :8080 that returns 200 OK on
+// /healthz. Used by docker-compose health checks. A port-bind failure is
+// logged but does not terminate the orchestrator process.
 func serveHealthz(ctx context.Context) {
+	startHealthzServer(ctx, ":8080")
+}
+
+// startHealthzServer binds addr and serves /healthz. Extracted for
+// testability — callers can supply an arbitrary address.
+func startHealthzServer(ctx context.Context, addr string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 	srv := &http.Server{
-		Addr:         ":8080",
+		Addr:         addr,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
@@ -205,6 +252,6 @@ func serveHealthz(ctx context.Context) {
 		_ = srv.Shutdown(context.Background())
 	}()
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal().Err(err).Msg("healthz server error")
+		log.Error().Err(err).Str("addr", addr).Msg("healthz server error — orchestrator continues")
 	}
 }
