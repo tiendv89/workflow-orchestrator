@@ -114,8 +114,10 @@ func (d *Dispatcher) registerHandle(ctx context.Context, handle string, task db.
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("broker returned status %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK &&
+		resp.StatusCode != http.StatusNoContent &&
+		resp.StatusCode != http.StatusConflict {
+		return fmt.Errorf("broker register: unexpected status %d", resp.StatusCode)
 	}
 	return nil
 }

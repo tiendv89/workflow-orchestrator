@@ -113,8 +113,17 @@ func TestReap_GoCompletion_InReview(t *testing.T) {
 		if r.URL.Path != "/list-completed" {
 			t.Errorf("unexpected path %q", r.URL.Path)
 		}
-		if r.URL.Query().Get("owner") != "go" {
-			t.Errorf("owner param = %q, want go", r.URL.Query().Get("owner"))
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %q, want POST", r.Method)
+		}
+		var reqBody struct {
+			Owner string `json:"owner"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		if reqBody.Owner != "go" {
+			t.Errorf("owner = %q, want go", reqBody.Owner)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))

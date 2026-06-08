@@ -105,27 +105,19 @@ func SetDone(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	// Guarded UPDATE within the transaction.
+	// Guarded UPDATE: fetch task_name in the same round-trip via RETURNING.
 	var id uuid.UUID
+	var taskName string
 	err = tx.QueryRow(ctx,
 		`UPDATE workspace_tasks SET status=$1, updated_at=now()
-		 WHERE workspace_id=$2 AND task_id=$3 AND status=$4 RETURNING id`,
+		 WHERE workspace_id=$2 AND task_id=$3 AND status=$4 RETURNING id, task_name`,
 		"done", workspaceID, taskUUID, "in_review",
-	).Scan(&id)
+	).Scan(&id, &taskName)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
 		return false, fmt.Errorf("SetDone: guarded update: %w", err)
-	}
-
-	// Look up the task_name so AutoReadyDependents can filter candidates.
-	var taskName string
-	if err := tx.QueryRow(ctx,
-		`SELECT task_name FROM workspace_tasks WHERE workspace_id=$1 AND task_id=$2`,
-		workspaceID, taskUUID,
-	).Scan(&taskName); err != nil {
-		return false, fmt.Errorf("SetDone: get task name: %w", err)
 	}
 
 	if _, err := AutoReadyDependents(ctx, tx, workspaceID, taskName); err != nil {

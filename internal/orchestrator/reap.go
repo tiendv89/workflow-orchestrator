@@ -1,14 +1,17 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
 
@@ -84,11 +87,16 @@ func (r *Reaper) reap(ctx context.Context, pool *pgxpool.Pool, hs *HandleStore, 
 }
 
 func (r *Reaper) listCompleted(ctx context.Context) ([]completionRecord, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		r.brokerURL+"/list-completed?owner=go&max=50", nil)
+	bodyJSON, err := json.Marshal(map[string]any{"owner": "go", "max": 50, "lock_ms": 30000})
+	if err != nil {
+		return nil, fmt.Errorf("marshal list-completed request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		r.brokerURL+"/list-completed", bytes.NewReader(bodyJSON))
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -179,8 +187,7 @@ func dbLookupTaskBySlug(
 		workspaceID, featureName, taskName,
 	).Scan(&featureUUID, &taskUUID)
 	if err != nil {
-		// pgx returns pgx.ErrNoRows for missing rows; other errors are DB errors.
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("dbLookupTaskBySlug: %w", err)

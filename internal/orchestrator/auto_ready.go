@@ -8,8 +8,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-
-	"github.com/tiendv89/workflow-orchestrator/internal/database/queries"
 )
 
 // AutoReadyDependents advances go-owned tasks from "todo" to "ready" when all
@@ -63,11 +61,10 @@ func AutoReadyDependents(
 		return nil, fmt.Errorf("AutoReadyDependents: rows: %w", err)
 	}
 
-	q := queries.New(tx)
 	var advanced []uuid.UUID
 
 	for _, c := range candidates {
-		allDone, err := allDepsAreDone(ctx, tx, workspaceID, c.dependsOn)
+		allDone, err := allDepsAreDone(ctx, tx, workspaceID, c.featureID, c.dependsOn)
 		if err != nil {
 			return nil, fmt.Errorf("AutoReadyDependents: check deps for %s: %w", c.taskName, err)
 		}
@@ -94,7 +91,7 @@ func AutoReadyDependents(
 		}
 
 		note := "dependencies met"
-		if err := appendLogInsert(ctx, q, workspaceID, c.featureID, c.taskID, "ready", "orchestrator", note); err != nil {
+		if err := appendLogInsert(ctx, tx, workspaceID, c.featureID, c.taskID, "ready", "orchestrator", note); err != nil {
 			return nil, fmt.Errorf("AutoReadyDependents: log %s: %w", c.taskName, err)
 		}
 
@@ -105,8 +102,9 @@ func AutoReadyDependents(
 }
 
 // allDepsAreDone returns true if every task name in deps is in "done" status
-// within the given workspace.
-func allDepsAreDone(ctx context.Context, tx pgx.Tx, workspaceID uuid.UUID, deps []string) (bool, error) {
+// within the given workspace and feature. The feature_id scope prevents false
+// positives when two features share the same task name.
+func allDepsAreDone(ctx context.Context, tx pgx.Tx, workspaceID, featureID uuid.UUID, deps []string) (bool, error) {
 	if len(deps) == 0 {
 		return true, nil
 	}
@@ -116,9 +114,10 @@ func allDepsAreDone(ctx context.Context, tx pgx.Tx, workspaceID uuid.UUID, deps 
 			SELECT status
 			FROM workspace_tasks
 			WHERE workspace_id = $1
-			  AND task_name    = $2
+			  AND feature_id   = $2
+			  AND task_name    = $3
 			LIMIT 1
-		`, workspaceID, dep).Scan(&status)
+		`, workspaceID, featureID, dep).Scan(&status)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				// Dependency task doesn't exist — treat as not done.

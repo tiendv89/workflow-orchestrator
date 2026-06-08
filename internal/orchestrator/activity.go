@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,16 +14,30 @@ import (
 	"github.com/tiendv89/workflow-orchestrator/internal/database/queries"
 )
 
-// appendLogInsert performs the sequence-fetch + insert within an already-open queries context.
-// Callers are responsible for transaction management.
+// advisoryKey maps a (workspace, feature, task) triple to a stable int64 advisory lock key.
+func advisoryKey(workspaceID, featureUUID, taskUUID uuid.UUID) int64 {
+	h := fnv.New64a()
+	h.Write(workspaceID[:])
+	h.Write(featureUUID[:])
+	h.Write(taskUUID[:])
+	return int64(h.Sum64())
+}
+
+// appendLogInsert performs the sequence-fetch + insert within an already-open transaction.
+// An advisory lock is acquired first to serialize concurrent appends for the same task.
 func appendLogInsert(
 	ctx context.Context,
-	q *queries.Queries,
+	tx pgx.Tx,
 	workspaceID, featureUUID, taskUUID uuid.UUID,
 	action, by, note string,
 ) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryKey(workspaceID, featureUUID, taskUUID)); err != nil {
+		return fmt.Errorf("advisory lock: %w", err)
+	}
+
 	featurePg := pgtype.UUID{Bytes: featureUUID, Valid: true}
 	taskPg := pgtype.UUID{Bytes: taskUUID, Valid: true}
+	q := queries.New(tx)
 
 	seq, err := q.GetNextActivitySequence(ctx, queries.GetNextActivitySequenceParams{
 		WorkspaceID: workspaceID,
@@ -74,7 +89,7 @@ func AppendLog(
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	if err := appendLogInsert(ctx, queries.New(tx), workspaceID, featureUUID, taskUUID, action, by, note); err != nil {
+	if err := appendLogInsert(ctx, tx, workspaceID, featureUUID, taskUUID, action, by, note); err != nil {
 		return fmt.Errorf("AppendLog: %w", err)
 	}
 
@@ -92,7 +107,7 @@ func AppendLogTx(
 	workspaceID, featureUUID, taskUUID uuid.UUID,
 	action, by, note string,
 ) error {
-	if err := appendLogInsert(ctx, queries.New(tx), workspaceID, featureUUID, taskUUID, action, by, note); err != nil {
+	if err := appendLogInsert(ctx, tx, workspaceID, featureUUID, taskUUID, action, by, note); err != nil {
 		return fmt.Errorf("AppendLogTx: %w", err)
 	}
 	return nil
