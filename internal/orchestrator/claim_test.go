@@ -57,10 +57,10 @@ func setupFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool) testFix
 	}
 
 	t.Cleanup(func() {
-		// Clean up in reverse FK order.
-		pool.Exec(ctx, `DELETE FROM workspace_tasks WHERE workspace_id = $1`, wsID)
-		pool.Exec(ctx, `DELETE FROM workspace_features WHERE workspace_id = $1`, wsID)
-		pool.Exec(ctx, `DELETE FROM workspaces WHERE id = $1`, wsID)
+		// Clean up in reverse FK order; errors are best-effort in test teardown.
+		_, _ = pool.Exec(ctx, `DELETE FROM workspace_tasks WHERE workspace_id = $1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspace_features WHERE workspace_id = $1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspaces WHERE id = $1`, wsID)
 	})
 
 	return testFixture{workspaceID: wsID, featureID: row.ID}
