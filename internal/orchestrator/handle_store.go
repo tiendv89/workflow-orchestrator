@@ -8,6 +8,7 @@ import (
 
 // HandleEntry records the DB identifiers for a dispatched task handle.
 type HandleEntry struct {
+	FeatureUUID uuid.UUID
 	TaskUUID    uuid.UUID
 	FeatureName string
 	TaskName    string
