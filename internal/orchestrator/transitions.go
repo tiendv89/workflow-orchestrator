@@ -94,12 +94,46 @@ func SetBlocked(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID u
 	return ok, nil
 }
 
-// SetDone transitions a task from "in_review" to "done".
+// SetDone transitions a task from "in_review" to "done" and, in the same
+// transaction, advances any go-owned todo tasks whose full dependency set is
+// now satisfied (AutoReadyDependents).
 // Returns (false, nil) when the task was not in "in_review".
 func SetDone(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error) {
-	ok, err := GuardedTransition(ctx, pool, workspaceID, taskUUID, "in_review", "done", nil)
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return false, fmt.Errorf("SetDone: %w", err)
+		return false, fmt.Errorf("SetDone: begin tx: %w", err)
 	}
-	return ok, nil
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Guarded UPDATE within the transaction.
+	var id uuid.UUID
+	err = tx.QueryRow(ctx,
+		`UPDATE workspace_tasks SET status=$1, updated_at=now()
+		 WHERE workspace_id=$2 AND task_id=$3 AND status=$4 RETURNING id`,
+		"done", workspaceID, taskUUID, "in_review",
+	).Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("SetDone: guarded update: %w", err)
+	}
+
+	// Look up the task_name so AutoReadyDependents can filter candidates.
+	var taskName string
+	if err := tx.QueryRow(ctx,
+		`SELECT task_name FROM workspace_tasks WHERE workspace_id=$1 AND task_id=$2`,
+		workspaceID, taskUUID,
+	).Scan(&taskName); err != nil {
+		return false, fmt.Errorf("SetDone: get task name: %w", err)
+	}
+
+	if _, err := AutoReadyDependents(ctx, tx, workspaceID, taskName); err != nil {
+		return false, fmt.Errorf("SetDone: auto-ready: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("SetDone: commit: %w", err)
+	}
+	return true, nil
 }
