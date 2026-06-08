@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -207,5 +208,69 @@ func TestFindEligibleTasks_UnknownWorkspace(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("expected 0 tasks for unknown workspace, got %d", len(got))
+	}
+}
+
+// TestFindEligibleTasks_QueryPlanUsesIndex runs EXPLAIN (FORMAT JSON, ANALYZE
+// FALSE) on the listEligibleTasks query and asserts that the planner selects
+// workspace_tasks_owner_status_idx — the (workspace_id, owner, status) index
+// created by T1 migration 00015_*_owner.
+func TestFindEligibleTasks_QueryPlanUsesIndex(t *testing.T) {
+	ctx, pool := openTestDB(t)
+
+	// Ensure the index exists. It is created by T1 (workflow-backend migration
+	// 00015_*_owner), but we guard with IF NOT EXISTS for test-DB
+	// self-sufficiency so this test can run in isolation.
+	_, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS workspace_tasks_owner_status_idx
+		ON workspace_tasks (workspace_id, owner, status)`)
+	if err != nil {
+		t.Fatalf("ensure index: %v", err)
+	}
+
+	// Acquire a dedicated connection so that SET enable_seqscan and EXPLAIN
+	// share the same session — pgxpool may route calls to different conns.
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire conn: %v", err)
+	}
+	defer conn.Release()
+
+	// Disable sequential scans so the planner is forced to consider the index
+	// even on a table with zero rows (where seq-scan cost would otherwise win).
+	if _, err = conn.Exec(ctx, "SET enable_seqscan = off"); err != nil {
+		t.Fatalf("SET enable_seqscan: %v", err)
+	}
+
+	// The SQL below is the exact text executed by queries.ListEligibleTasks.
+	// Keep it in sync with db/queries/tasks.sql → listEligibleTasks.
+	const explainSQL = `EXPLAIN (FORMAT JSON, ANALYZE FALSE)
+SELECT t.id, t.workspace_id, t.feature_id, t.feature_name, t.task_id, t.task_name,
+       t.title, t.repo, t.status, t.depends_on, t.blocked_reason, t.branch,
+       t.execution, t.pr, t.workspace_pr, t.source_path, t.source_hash,
+       t.owner, t.created_at, t.updated_at
+FROM workspace_tasks t
+WHERE t.workspace_id = $1
+  AND t.owner = 'go'
+  AND t.status = 'ready'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements_text(t.depends_on) AS dep
+      WHERE NOT EXISTS (
+          SELECT 1
+          FROM workspace_tasks dep_task
+          WHERE dep_task.workspace_id = t.workspace_id
+            AND dep_task.feature_id  = t.feature_id
+            AND dep_task.task_name   = dep
+            AND dep_task.status      = 'done'
+      )
+  )`
+
+	var planJSON string
+	if err = conn.QueryRow(ctx, explainSQL, uuid.New()).Scan(&planJSON); err != nil {
+		t.Fatalf("EXPLAIN scan: %v", err)
+	}
+
+	if !strings.Contains(planJSON, "workspace_tasks_owner_status_idx") {
+		t.Errorf("query plan does not reference workspace_tasks_owner_status_idx;\nplan:\n%s", planJSON)
 	}
 }
