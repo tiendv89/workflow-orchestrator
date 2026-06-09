@@ -26,8 +26,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"sort"
-	"strings"
 	"sync"
 	"testing"
 
@@ -45,7 +43,7 @@ import (
 // ─── test main ───────────────────────────────────────────────────────────────
 
 // TestMain provisions a Postgres database for the test suite by applying the
-// real goose migrations in db/migrations/ order.
+// schema snapshot from db/testdata/schema.sql.
 //
 //   - If DATABASE_URL is set, use that instance.
 //   - Otherwise, start a local Postgres container with testcontainers-go.
@@ -102,16 +100,10 @@ func runTestSuite(m *testing.M) int {
 	return m.Run()
 }
 
-// applyMigrations applies the SQL migration files from db/migrations/ in
-// lexicographic (version) order.  Each file must be in goose format:
-//
-//	-- +goose Up
-//	<SQL DDL>
-//	-- +goose Down
-//	<rollback DDL>
-//
-// Only the "Up" section of each migration is executed.
-// The function is idempotent when used with IF NOT EXISTS / IF EXISTS guards.
+// applyMigrations applies the schema snapshot from db/testdata/schema.sql.
+// The snapshot is a single idempotent SQL file (no goose markers) that
+// represents the combined final state of all workflow-backend migrations up
+// to and including the owner-discriminator and FK-fix changes.
 func applyMigrations(ctx context.Context, dsn string) error {
 	pool, err := database.Open(ctx, dsn)
 	if err != nil {
@@ -119,51 +111,14 @@ func applyMigrations(ctx context.Context, dsn string) error {
 	}
 	defer database.Close(pool)
 
-	entries, err := os.ReadDir("../../db/migrations")
+	raw, err := os.ReadFile("../../db/testdata/schema.sql")
 	if err != nil {
-		return fmt.Errorf("read migrations dir: %w", err)
+		return fmt.Errorf("read schema snapshot: %w", err)
 	}
-
-	// Ensure deterministic order.
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Name() < entries[j].Name()
-	})
-
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
-			continue
-		}
-		raw, err := os.ReadFile("../../db/migrations/" + entry.Name())
-		if err != nil {
-			return fmt.Errorf("read %s: %w", entry.Name(), err)
-		}
-		upSQL := extractGooseUp(string(raw))
-		if upSQL == "" {
-			continue
-		}
-		if _, err := pool.Exec(ctx, upSQL); err != nil {
-			return fmt.Errorf("apply %s: %w", entry.Name(), err)
-		}
+	if _, err := pool.Exec(ctx, string(raw)); err != nil {
+		return fmt.Errorf("apply schema snapshot: %w", err)
 	}
 	return nil
-}
-
-// extractGooseUp parses a goose SQL file and returns only the "-- +goose Up"
-// section.  Returns empty string when no Up section is found.
-func extractGooseUp(content string) string {
-	const (
-		upMarker   = "-- +goose Up"
-		downMarker = "-- +goose Down"
-	)
-	upIdx := strings.Index(content, upMarker)
-	if upIdx == -1 {
-		return ""
-	}
-	after := content[upIdx+len(upMarker):]
-	if downIdx := strings.Index(after, downMarker); downIdx != -1 {
-		after = after[:downIdx]
-	}
-	return strings.TrimSpace(after)
 }
 
 // ─── faithful in-process broker ──────────────────────────────────────────────

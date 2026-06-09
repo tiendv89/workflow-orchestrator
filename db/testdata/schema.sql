@@ -1,6 +1,19 @@
--- +goose Up
--- Base workspace schema (migrations 00001–00014 from workflow-backend).
--- Equivalent to the state BEFORE the v003 owner additions (00015).
+-- Test-only schema snapshot for workflow-orchestrator.
+--
+-- This file is the authoritative source for test database setup. It represents
+-- the combined final state after:
+--   • workflow-backend/migrations/00001–00014 (base workspace schema)
+--   • workflow-backend/migrations/00015_*_owner (owner discriminator + relaxed source_path)
+--   • workflow-backend/migrations/00016_*_fix_feature_id_fk (FK target correction)
+--
+-- The 00015 and 00016 equivalents are committed as separate goose files in
+-- db/testdata/migration-a-owner.sql and db/testdata/migration-b-fk-fix.sql,
+-- which serve as the migration artifact for T23 (workflow-backend migration task).
+--
+-- DO NOT add goose markers. This file is executed as a single SQL batch by
+-- TestMain in internal/orchestrator/ and test/e2e/.
+--
+-- Keep in sync with workflow-backend's canonical migration chain.
 
 CREATE TABLE IF NOT EXISTS workspaces (
     id                 uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -24,18 +37,23 @@ CREATE TABLE IF NOT EXISTS workspace_features (
     current_stage  text,
     next_action    text,
     stages         jsonb,
-    source_path    text        NOT NULL DEFAULT '',
+    source_path    text,
     source_hash    text,
+    owner          text,
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),
     UNIQUE (workspace_id, feature_name),
-    UNIQUE (workspace_id, feature_id)
+    UNIQUE (workspace_id, feature_id),
+    UNIQUE (feature_id)
 );
 
+-- workspace_tasks.feature_id references workspace_features(feature_id), the
+-- business-key UUID, not workspace_features.id (the surrogate PK). This matches
+-- the corrected FK introduced in migration 00016.
 CREATE TABLE IF NOT EXISTS workspace_tasks (
     id             uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id   uuid        NOT NULL REFERENCES workspaces(id),
-    feature_id     uuid        NOT NULL REFERENCES workspace_features(id),
+    feature_id     uuid        NOT NULL REFERENCES workspace_features(feature_id),
     feature_name   text        NOT NULL,
     task_id        uuid        NOT NULL DEFAULT gen_random_uuid(),
     task_name      text        NOT NULL,
@@ -48,8 +66,9 @@ CREATE TABLE IF NOT EXISTS workspace_tasks (
     execution      jsonb,
     pr             jsonb,
     workspace_pr   jsonb,
-    source_path    text        NOT NULL DEFAULT '',
+    source_path    text,
     source_hash    text,
+    owner          text,
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),
     UNIQUE (workspace_id, feature_id, task_name),
@@ -73,8 +92,8 @@ CREATE TABLE IF NOT EXISTS workspace_activity_events (
     created_at   timestamptz NOT NULL DEFAULT now()
 );
 
--- +goose Down
-DROP TABLE IF EXISTS workspace_activity_events;
-DROP TABLE IF EXISTS workspace_tasks;
-DROP TABLE IF EXISTS workspace_features;
-DROP TABLE IF EXISTS workspaces;
+CREATE INDEX IF NOT EXISTS workspace_features_workspace_owner
+    ON workspace_features (workspace_id, owner);
+
+CREATE INDEX IF NOT EXISTS workspace_tasks_workspace_owner_status
+    ON workspace_tasks (workspace_id, owner, status);

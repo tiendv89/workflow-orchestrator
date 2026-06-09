@@ -1,9 +1,13 @@
--- +goose Up
--- Migration 00015: v003 owner additions (workflow-backend/migrations/00015_*_owner).
--- Adds nullable owner discriminator to workspace_features and workspace_tasks.
--- NULL/absent = legacy git/YAML (TS orchestrator); 'go' = DB-native (Go orchestrator).
--- Also relaxes source_path to nullable (go-owned rows have no YAML origin).
+-- Migration artifact: owner discriminator columns (workflow-orchestrator T22).
+--
+-- This file is the migration source artifact for T23 (workflow-backend migration task).
+-- T23 must copy this SQL into the next-numbered goose file in workflow-backend/migrations/
+-- and then delete this file from workflow-orchestrator once the workflow-backend migration
+-- has been applied and verified in production.
+--
+-- Goose format: add +goose markers when writing the workflow-backend migration file.
 
+-- +goose Up
 ALTER TABLE workspace_features
     ADD COLUMN IF NOT EXISTS owner text,
     ALTER COLUMN source_path DROP NOT NULL,
@@ -14,7 +18,6 @@ ALTER TABLE workspace_tasks
     ALTER COLUMN source_path DROP NOT NULL,
     ALTER COLUMN source_path DROP DEFAULT;
 
--- Indexes for eligibility scan and sync adapter scoping.
 CREATE INDEX IF NOT EXISTS workspace_features_workspace_owner
     ON workspace_features (workspace_id, owner);
 
