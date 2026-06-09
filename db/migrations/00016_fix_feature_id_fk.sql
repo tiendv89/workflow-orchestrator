@@ -9,11 +9,12 @@
 -- composite index is not sufficient for a single-column FK reference).
 
 ALTER TABLE workspace_features
+    DROP CONSTRAINT IF EXISTS workspace_features_feature_id_key;
+ALTER TABLE workspace_features
     ADD CONSTRAINT workspace_features_feature_id_key UNIQUE (feature_id);
 
 ALTER TABLE workspace_tasks
-    DROP CONSTRAINT workspace_tasks_feature_id_fkey;
-
+    DROP CONSTRAINT IF EXISTS workspace_tasks_feature_id_fkey;
 ALTER TABLE workspace_tasks
     ADD CONSTRAINT workspace_tasks_feature_id_fkey
     FOREIGN KEY (feature_id) REFERENCES workspace_features(feature_id);
