@@ -262,6 +262,15 @@ func (b *faithfulBroker) listCompletedOwnersSeen() []string {
 	return out
 }
 
+// listCompletedCallCount returns the number of POST /list-completed calls recorded so far.
+// Use this to snapshot a position before a test-initiated drain so the A3 assertion
+// can skip that probe entry when checking orchestrator-only calls.
+func (b *faithfulBroker) listCompletedCallCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.listCompletedBodies)
+}
+
 func (b *faithfulBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/register":
@@ -823,6 +832,10 @@ func TestCoexistence(t *testing.T) {
 	// The go completion is now in the "go" owner queue. A simulated ts-owner
 	// drain must return an empty list, proving the faithfulBroker partitions
 	// correctly (mirrors real broker owner-partitioned queues).
+	//
+	// Snapshot the call count before this explicit probe so the A3 assertion
+	// can skip this entry when checking orchestrator-only calls.
+	preDrainCallCount := broker.listCompletedCallCount()
 	t.Log("assert A2 partition isolation: ts drain sees 0 go completions")
 	tsCompletions := drainOwner(t, brokerSrv.URL, "ts")
 	if len(tsCompletions) != 0 {
@@ -887,14 +900,14 @@ func TestCoexistence(t *testing.T) {
 	// protocol is ready when the real broker enforces partitioning.
 	t.Log("assert A3: go reaper uses owner=go in POST /list-completed body")
 	listOwners := broker.listCompletedOwnersSeen()
-	for _, owner := range listOwners {
+	goDrains := 0
+	for i, owner := range listOwners {
+		if i == preDrainCallCount {
+			continue // skip the explicit A2 "ts" partition probe — not an orchestrator call
+		}
 		if owner != "go" {
 			t.Errorf("A3 FAIL: go orchestrator issued list-completed with owner=%q, want 'go'", owner)
-		}
-	}
-	goDrains := 0
-	for _, owner := range listOwners {
-		if owner == "go" {
+		} else {
 			goDrains++
 		}
 	}
