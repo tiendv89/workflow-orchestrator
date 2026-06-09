@@ -213,15 +213,15 @@ func TestFindEligibleTasks_UnknownWorkspace(t *testing.T) {
 
 // TestFindEligibleTasks_QueryPlanUsesIndex runs EXPLAIN (FORMAT JSON, ANALYZE
 // FALSE) on the listEligibleTasks query and asserts that the planner selects
-// workspace_tasks_owner_status_idx — the (workspace_id, owner, status) index
-// created by T1 migration 00015_*_owner.
+// workspace_tasks_workspace_owner_status — the (workspace_id, owner, status) index
+// created by migration 00015_owner.
 func TestFindEligibleTasks_QueryPlanUsesIndex(t *testing.T) {
 	ctx, pool := openTestDB(t)
 
-	// Ensure the index exists. It is created by T1 (workflow-backend migration
-	// 00015_*_owner), but we guard with IF NOT EXISTS for test-DB
-	// self-sufficiency so this test can run in isolation.
-	_, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS workspace_tasks_owner_status_idx
+	// Ensure the index exists. It is created by migration 00015_owner, but we
+	// guard with IF NOT EXISTS for test-DB self-sufficiency so this test can
+	// run in isolation.
+	_, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS workspace_tasks_workspace_owner_status
 		ON workspace_tasks (workspace_id, owner, status)`)
 	if err != nil {
 		t.Fatalf("ensure index: %v", err)
@@ -270,7 +270,7 @@ WHERE t.workspace_id = $1
 		t.Fatalf("EXPLAIN scan: %v", err)
 	}
 
-	if !strings.Contains(planJSON, "workspace_tasks_owner_status_idx") {
-		t.Errorf("query plan does not reference workspace_tasks_owner_status_idx;\nplan:\n%s", planJSON)
+	if !strings.Contains(planJSON, "workspace_tasks_workspace_owner_status") {
+		t.Errorf("query plan does not reference workspace_tasks_workspace_owner_status;\nplan:\n%s", planJSON)
 	}
 }

@@ -8,13 +8,17 @@
 -- it as a single-column FK target (the existing UNIQUE(workspace_id, feature_id)
 -- composite index is not sufficient for a single-column FK reference).
 
+-- Drop FK first; it depends on the UNIQUE constraint below.
+ALTER TABLE workspace_tasks
+    DROP CONSTRAINT IF EXISTS workspace_tasks_feature_id_fkey;
+
+-- Recreate the UNIQUE constraint on the business key (safe now that FK is gone).
 ALTER TABLE workspace_features
     DROP CONSTRAINT IF EXISTS workspace_features_feature_id_key;
 ALTER TABLE workspace_features
     ADD CONSTRAINT workspace_features_feature_id_key UNIQUE (feature_id);
 
-ALTER TABLE workspace_tasks
-    DROP CONSTRAINT IF EXISTS workspace_tasks_feature_id_fkey;
+-- Recreate the FK pointing to the business key.
 ALTER TABLE workspace_tasks
     ADD CONSTRAINT workspace_tasks_feature_id_fkey
     FOREIGN KEY (feature_id) REFERENCES workspace_features(feature_id);
