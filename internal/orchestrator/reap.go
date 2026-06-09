@@ -81,6 +81,11 @@ func (r *Reaper) reap(ctx context.Context, pool *pgxpool.Pool, hs *HandleStore, 
 	for _, c := range completions {
 		if err := r.processOne(ctx, pool, hs, workspaceUUID, c); err != nil {
 			log.Warn().Err(err).Str("handle", c.Handle).Msg("reap: failed to process completion — skipping")
+			continue
+		}
+		// Commit consumption: removes the handle from the broker queue and registry.
+		if err := r.ackCompletion(ctx, c.Handle); err != nil {
+			log.Warn().Err(err).Str("handle", c.Handle).Msg("reap: ack failed — item will be redelivered after lock expires")
 		}
 	}
 	return nil
@@ -117,6 +122,31 @@ func (r *Reaper) listCompleted(ctx context.Context) ([]completionRecord, error) 
 		return nil, fmt.Errorf("unmarshal completions: %w", err)
 	}
 	return records, nil
+}
+
+// ackCompletion commits consumption of a handle by POST /ack.
+// A non-2xx response is returned as an error but does not stop processing;
+// the item will be redelivered by the broker after the visibility-timeout expires.
+func (r *Reaper) ackCompletion(ctx context.Context, handle string) error {
+	bodyJSON, err := json.Marshal(map[string]string{"handle": handle})
+	if err != nil {
+		return fmt.Errorf("marshal ack: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		r.brokerURL+"/ack", bytes.NewReader(bodyJSON))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("broker ack returned status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (r *Reaper) processOne(

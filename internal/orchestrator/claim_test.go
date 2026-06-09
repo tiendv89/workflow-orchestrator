@@ -64,7 +64,7 @@ func setupFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool) testFix
 		_, _ = pool.Exec(ctx, `DELETE FROM workspaces WHERE id = $1`, wsID)
 	})
 
-	return testFixture{workspaceID: wsID, featureID: row.ID}
+	return testFixture{workspaceID: wsID, featureID: row.FeatureID}
 }
 
 // insertReadyTask inserts a task in "ready" status and returns its task_id.
