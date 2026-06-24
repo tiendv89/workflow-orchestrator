@@ -1,33 +1,18 @@
+//go:build integration
+
 package orchestrator_test
 
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/tiendv89/workflow-orchestrator/internal/database"
 	"github.com/tiendv89/workflow-orchestrator/internal/database/queries"
 	"github.com/tiendv89/workflow-orchestrator/internal/orchestrator"
 )
-
-// openPool returns a connected pool or skips the test if DATABASE_URL is unset.
-func openPool(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		t.Skip("DATABASE_URL not set — skipping integration test")
-	}
-	pool, err := database.Open(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("database.Open: %v", err)
-	}
-	t.Cleanup(func() { database.Close(pool) })
-	return pool
-}
 
 // insertWorkspace inserts a minimal workspace and returns its UUID.
 func insertWorkspace(t *testing.T, ctx context.Context, pool *pgxpool.Pool, orgID uuid.UUID) uuid.UUID {
