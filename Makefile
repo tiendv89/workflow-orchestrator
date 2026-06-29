@@ -8,6 +8,9 @@ run:
 test:
 	go test ./... -race
 
+test-e2e:
+	go test ./test/e2e/... -tags integration -v -count=1 -timeout 120s
+
 fmt:
 	go fmt ./...
 

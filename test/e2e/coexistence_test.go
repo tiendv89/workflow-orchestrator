@@ -71,6 +71,7 @@ func runTestSuite(m *testing.M) int {
 		tcpostgres.WithDatabase("workflow_e2e"),
 		tcpostgres.WithUsername("postgres"),
 		tcpostgres.WithPassword("postgres"),
+		tcpostgres.BasicWaitStrategies(),
 	)
 	if err != nil {
 		// Docker unavailable or image pull failed.
@@ -465,6 +466,17 @@ func seedWorkspace(t *testing.T, ctx context.Context, pool *pgxpool.Pool) uuid.U
 	return wsID
 }
 
+func seedWorkspaceRepo(t *testing.T, ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID, repoID, repoURL string) {
+	t.Helper()
+	_, err := pool.Exec(ctx,
+		`INSERT INTO workspace_repos (workspace_id, repo_id, repo_url) VALUES ($1, $2, $3)`,
+		wsID, repoID, repoURL,
+	)
+	if err != nil {
+		t.Fatalf("seedWorkspaceRepo: %v", err)
+	}
+}
+
 func seedTSFeature(
 	t *testing.T,
 	ctx context.Context,
@@ -691,8 +703,10 @@ func TestCoexistence(t *testing.T) {
 		_, _ = pool.Exec(ctx, `DELETE FROM workspace_activity_events WHERE workspace_id=$1`, wsID)
 		_, _ = pool.Exec(ctx, `DELETE FROM workspace_tasks            WHERE workspace_id=$1`, wsID)
 		_, _ = pool.Exec(ctx, `DELETE FROM workspace_features         WHERE workspace_id=$1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspace_repos            WHERE workspace_id=$1`, wsID)
 		_, _ = pool.Exec(ctx, `DELETE FROM workspaces                 WHERE id=$1`, wsID)
 	})
+	seedWorkspaceRepo(t, ctx, pool, wsID, "workflow-orchestrator", "git@github.com:owner/workflow-orchestrator.git")
 
 	// Seed go-owned feature with one task (no dependencies → auto-ready).
 	goSpec := orchestrator.GoFeatureSpec{
@@ -748,7 +762,7 @@ func TestCoexistence(t *testing.T) {
 	streamer := &mockStreamer{}
 
 	cfg := buildCfg(wsID, brokerSrv.URL)
-	dispatcher := orchestrator.NewDispatcher(brokerSrv.URL, streamer, brokerSrv.Client())
+	dispatcher := orchestrator.NewDispatcher(brokerSrv.URL, streamer, brokerSrv.Client(), queries.New(pool))
 	hs := orchestrator.NewHandleStore()
 	executorID := "go-orchestrator/e2e-test"
 
