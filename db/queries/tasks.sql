@@ -76,6 +76,7 @@ UPDATE workspace_tasks
 SET
     status     = @new_status,
     execution  = COALESCE(@execution::jsonb, execution),
+    branch     = COALESCE(@branch, branch),
     updated_at = now()
 WHERE workspace_id = @workspace_id
   AND task_id      = @task_id

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/rs/zerolog/log"
 )
 
 // PRStatus holds the relevant merge/state fields of a GitHub pull request.
@@ -52,7 +54,11 @@ func (c *Client) GetPR(ctx context.Context, prURL string) (*PRStatus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("GetPR: http request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Warn().Err(err).Msg("github: close response body")
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GetPR: unexpected status %d for %s", resp.StatusCode, prURL)

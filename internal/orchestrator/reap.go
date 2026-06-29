@@ -106,7 +106,11 @@ func (r *Reaper) listCompleted(ctx context.Context) ([]completionRecord, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Warn().Err(err).Msg("reap: close response body")
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("broker returned status %d", resp.StatusCode)
@@ -142,7 +146,11 @@ func (r *Reaper) ackCompletion(ctx context.Context, handle string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Warn().Err(err).Msg("reap: close response body")
+		}
+	}()
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("broker ack returned status %d", resp.StatusCode)
 	}

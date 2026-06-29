@@ -4,15 +4,25 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog/log"
 	"github.com/tiendv89/workflow-orchestrator/internal/config"
 	db "github.com/tiendv89/workflow-orchestrator/internal/database/queries"
 )
+
+const defaultImplementationModel = "claude-sonnet-4-6"
+
+// dbQuerier is the minimal DB interface used by Dispatcher.
+type dbQuerier interface {
+	GetWorkspaceRepo(ctx context.Context, params db.GetWorkspaceRepoParams) (db.WorkspaceRepo, error)
+	GetWorkspaceDefaultModel(ctx context.Context, params db.GetWorkspaceDefaultModelParams) (db.Model, error)
+}
 
 // Streamer is the minimal interface for appending to a Redis stream.
 // The real implementation wraps *redis.Client; tests inject a mock.
@@ -60,19 +70,20 @@ type brokerRegisterRequest struct {
 // dispatchJob is the payload marshalled as the single "job" field on the Redis dispatch stream.
 // It mirrors DispatchJob in agent-workflow/runtime/abi/src/types.ts:50-96.
 type dispatchJob struct {
-	Handle             string `json:"handle"`
-	Nonce              string `json:"nonce"`
-	Kind               string `json:"kind"`
-	TaskID             string `json:"task_id"`
-	FeatureID          string `json:"feature_id"`
-	WorkspaceID        string `json:"workspace_id"`
-	TaskRepoURL        string `json:"task_repo_url"`
-	TaskRepoBranch     string `json:"task_repo_branch"`
-	TaskBaseBranch     string `json:"task_base_branch"`
-	TaskRepoBaseBranch string `json:"task_repo_base_branch"`
-	MgmtRepoURL        string `json:"mgmt_repo_url"`
-	CallbackURL        string `json:"callback_url"`
-	EnqueuedAt         string `json:"enqueued_at"`
+	Handle              string `json:"handle"`
+	Nonce               string `json:"nonce"`
+	Kind                string `json:"kind"`
+	TaskID              string `json:"task_id"`
+	FeatureID           string `json:"feature_id"`
+	WorkspaceID         string `json:"workspace_id"`
+	TaskRepoURL         string `json:"task_repo_url"`
+	TaskRepoBranch      string `json:"task_repo_branch"`
+	TaskBaseBranch      string `json:"task_base_branch"`
+	TaskRepoBaseBranch  string `json:"task_repo_base_branch"`
+	MgmtRepoURL         string `json:"mgmt_repo_url"`
+	CallbackURL         string `json:"callback_url"`
+	EnqueuedAt          string `json:"enqueued_at"`
+	ImplementationModel string `json:"implementation_model,omitempty"`
 }
 
 // Dispatcher handles broker registration and Redis stream enqueuing for a task.
@@ -81,14 +92,19 @@ type Dispatcher struct {
 	brokerURL  string
 	httpClient *http.Client
 	stream     Streamer
+	db         dbQuerier
 }
 
 // NewDispatcher constructs a Dispatcher. Pass nil for httpClient to use the default.
-func NewDispatcher(brokerURL string, stream Streamer, httpClient *http.Client) *Dispatcher {
+func NewDispatcher(brokerURL string, stream Streamer, httpClient *http.Client, q *db.Queries) *Dispatcher {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 10 * time.Second}
 	}
-	return &Dispatcher{brokerURL: brokerURL, httpClient: httpClient, stream: stream}
+	d := &Dispatcher{brokerURL: brokerURL, httpClient: httpClient, stream: stream}
+	if q != nil {
+		d.db = q
+	}
+	return d
 }
 
 // Dispatch registers the handle with the broker and enqueues the DispatchJob.
@@ -109,7 +125,14 @@ func (d *Dispatcher) Dispatch(ctx context.Context, cfg *config.Config, task db.W
 	return nil
 }
 
-func (d *Dispatcher) registerHandle(ctx context.Context, handle string, task db.WorkspaceTask, tenantID, nonce, startedAt string) error {
+func (d *Dispatcher) registerHandle(
+	ctx context.Context,
+	handle string,
+	task db.WorkspaceTask,
+	tenantID string,
+	nonce string,
+	startedAt string,
+) error {
 	body := brokerRegisterRequest{
 		Handle: handle,
 		Nonce:  nonce,
@@ -138,7 +161,11 @@ func (d *Dispatcher) registerHandle(ctx context.Context, handle string, task db.
 	if err != nil {
 		return fmt.Errorf("post: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Warn().Err(err).Msg("dispatch: close response body")
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK &&
 		resp.StatusCode != http.StatusNoContent &&
@@ -149,25 +176,27 @@ func (d *Dispatcher) registerHandle(ctx context.Context, handle string, task db.
 }
 
 func (d *Dispatcher) enqueueJob(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle, nonce, now string) error {
-	branch := ""
-	if task.Branch != nil {
-		branch = *task.Branch
+	branch := ResolveTaskBranch(task)
+	repoURL, err := d.getRepoURL(ctx, cfg, task)
+	if err != nil {
+		return fmt.Errorf("get repo URL: %w", err)
 	}
 
 	job := dispatchJob{
-		Handle:             handle,
-		Nonce:              nonce,
-		Kind:               "impl",
-		TaskID:             task.TaskName,
-		FeatureID:          task.FeatureName,
-		WorkspaceID:        cfg.WorkspaceID,
-		TaskRepoURL:        cfg.ImplRepoURL,
-		TaskRepoBranch:     branch,
-		TaskBaseBranch:     cfg.BaseBranch,
-		TaskRepoBaseBranch: cfg.BaseBranch,
-		MgmtRepoURL:        cfg.ManagementRepo,
-		CallbackURL:        cfg.BrokerURL + "/callback",
-		EnqueuedAt:         now,
+		Handle:              handle,
+		Nonce:               nonce,
+		Kind:                "impl",
+		TaskID:              task.TaskName,
+		FeatureID:           task.FeatureName,
+		WorkspaceID:         cfg.WorkspaceID,
+		TaskRepoURL:         repoURL,
+		TaskRepoBranch:      branch,
+		TaskBaseBranch:      FeatureBranchName(task.FeatureName),
+		TaskRepoBaseBranch:  cfg.BaseBranch,
+		MgmtRepoURL:         cfg.ManagementRepo,
+		CallbackURL:         cfg.BrokerURL + "/callback",
+		EnqueuedAt:          now,
+		ImplementationModel: d.getModelID(ctx, cfg.WorkspaceID),
 	}
 
 	payload, err := json.Marshal(job)
@@ -178,4 +207,46 @@ func (d *Dispatcher) enqueueJob(ctx context.Context, cfg *config.Config, task db
 	return d.stream.StreamAdd(ctx, "platform:dispatch", map[string]string{
 		"job": string(payload),
 	})
+}
+
+func (d *Dispatcher) getRepoURL(
+	ctx context.Context,
+	cfg *config.Config,
+	task db.WorkspaceTask,
+) (string, error) {
+	if d.db == nil || task.Repo == nil {
+		return "", errors.New("no db and repo to get repo URL")
+	}
+
+	workspaceUUID, _ := uuid.Parse(cfg.WorkspaceID)
+	repo, err := d.db.GetWorkspaceRepo(ctx, db.GetWorkspaceRepoParams{
+		WorkspaceID: workspaceUUID,
+		RepoID:      *task.Repo,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	if repo.RepoURL == nil || *repo.RepoURL == "" {
+		return "", errors.New("repo URL is nil or empty")
+	}
+
+	return *repo.RepoURL, nil
+}
+
+func (d *Dispatcher) getModelID(ctx context.Context, workspaceID string) string {
+	if d.db == nil {
+		return defaultImplementationModel
+	}
+	wsUUID, _ := uuid.Parse(workspaceID)
+	model, err := d.db.GetWorkspaceDefaultModel(ctx, db.GetWorkspaceDefaultModelParams{
+		WorkspaceID: wsUUID,
+		Phase:       "implementation", // TODO: make this constant/enum
+	})
+	if err != nil {
+		log.Warn().Err(err).Str("workspace_id", workspaceID).
+			Msg("dispatch: model policy lookup failed, using default")
+		return defaultImplementationModel
+	}
+	return model.ModelID
 }

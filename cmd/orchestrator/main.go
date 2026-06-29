@@ -52,14 +52,19 @@ func main() {
 		log.Fatal().Err(err).Msg("parse redis URL")
 	}
 	rdb := redis.NewClient(rdbOpts)
-	defer rdb.Close()
+	defer func() {
+		if err := rdb.Close(); err != nil {
+			log.Warn().Err(err).Msg("close redis client")
+		}
+	}()
 
 	streamer := orchestrator.NewRedisStreamer(rdb)
-	dispatcher := orchestrator.NewDispatcher(cfg.BrokerURL, streamer, nil)
+	q := db.New(pool)
+	dispatcher := orchestrator.NewDispatcher(cfg.BrokerURL, streamer, nil, q)
 	hs := orchestrator.NewHandleStore()
 	ghClient := gh.NewClient(cfg.GitHubToken)
 
-	go serveHealthz(ctx)
+	go serveHealthz(ctx, cfg.HealthPort)
 
 	executorID := fmt.Sprintf("go-orchestrator/%s", cfg.WorkspaceID)
 
@@ -72,8 +77,8 @@ func main() {
 		findEligible: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error) {
 			return orchestrator.FindEligibleTasks(ctx, pool, wsID)
 		},
-		claimTask: func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, executor string) (bool, error) {
-			return orchestrator.ClaimTask(ctx, pool, wsID, taskID, executor)
+		claimTask: func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, featureName, taskName, executor string) (bool, error) {
+			return orchestrator.ClaimTask(ctx, pool, wsID, taskID, featureName, taskName, executor)
 		},
 		rollbackClaim: func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID) (bool, error) {
 			return orchestrator.RollbackClaim(ctx, pool, wsID, taskID)
@@ -143,7 +148,7 @@ func (s *pollState) next(hadError bool) time.Duration {
 // Production code wires real implementations; tests inject stubs.
 type loopConfig struct {
 	findEligible  func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
-	claimTask     func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, executor string) (bool, error)
+	claimTask     func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, featureName, taskName, executor string) (bool, error)
 	rollbackClaim func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID) (bool, error)
 	dispatch      func(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error
 	reapCompleted func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, hs *orchestrator.HandleStore) error
@@ -175,7 +180,7 @@ func runCycle(
 		for _, task := range tasks {
 			handle := lc.newHandle().String()
 
-			won, claimErr := lc.claimTask(ctx, pool, workspaceID, task.TaskID, executorID)
+			won, claimErr := lc.claimTask(ctx, pool, workspaceID, task.TaskID, task.FeatureName, task.TaskName, executorID)
 			if claimErr != nil {
 				log.Error().Err(claimErr).Str("task", task.TaskName).Msg("poll: ClaimTask error")
 				hadError = true
@@ -226,11 +231,11 @@ func runCycle(
 	return hadError
 }
 
-// serveHealthz starts a minimal HTTP server on :8080 that returns 200 OK on
-// /healthz. Used by docker-compose health checks. A port-bind failure is
-// logged but does not terminate the orchestrator process.
-func serveHealthz(ctx context.Context) {
-	startHealthzServer(ctx, ":8080")
+// serveHealthz starts a minimal HTTP server that returns 200 OK on /healthz.
+// Used by docker-compose health checks. A port-bind failure is logged but does
+// not terminate the orchestrator process.
+func serveHealthz(ctx context.Context, port int) {
+	startHealthzServer(ctx, fmt.Sprintf(":%d", port))
 }
 
 // startHealthzServer binds addr and serves /healthz. Extracted for

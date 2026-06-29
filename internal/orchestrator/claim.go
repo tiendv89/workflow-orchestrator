@@ -22,7 +22,12 @@ import (
 //   - (true, nil)  — claim won; the task is now in_progress.
 //   - (false, nil) — claim lost (task was not in "ready" state); not an error.
 //   - (false, err) — a database error occurred.
-func ClaimTask(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, executorID string) (bool, error) {
+func ClaimTask(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	workspaceID, taskUUID uuid.UUID,
+	featureName, taskName, executorID string,
+) (bool, error) {
 	execution, err := buildExecution(executorID)
 	if err != nil {
 		return false, fmt.Errorf("claim: build execution payload: %w", err)
@@ -30,11 +35,13 @@ func ClaimTask(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uu
 
 	ready := "ready"
 	inProgress := "in_progress"
+	branch := TaskBranchName(featureName, taskName)
 
 	q := queries.New(pool)
 	_, err = q.GuardedUpdateTaskStatus(ctx, queries.GuardedUpdateTaskStatusParams{
 		NewStatus:      &inProgress,
 		Execution:      execution,
+		Branch:         &branch,
 		WorkspaceID:    workspaceID,
 		TaskID:         taskUUID,
 		ExpectedStatus: &ready,

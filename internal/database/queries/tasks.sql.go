@@ -77,16 +77,18 @@ UPDATE workspace_tasks
 SET
     status     = $1,
     execution  = COALESCE($2::jsonb, execution),
+    branch     = COALESCE($3, branch),
     updated_at = now()
-WHERE workspace_id = $3
-  AND task_id      = $4
-  AND status       = $5
+WHERE workspace_id = $4
+  AND task_id      = $5
+  AND status       = $6
 RETURNING id
 `
 
 type GuardedUpdateTaskStatusParams struct {
 	NewStatus      *string   `json:"new_status"`
 	Execution      []byte    `json:"execution"`
+	Branch         *string   `json:"branch"`
 	WorkspaceID    uuid.UUID `json:"workspace_id"`
 	TaskID         uuid.UUID `json:"task_id"`
 	ExpectedStatus *string   `json:"expected_status"`
@@ -99,6 +101,7 @@ func (q *Queries) GuardedUpdateTaskStatus(ctx context.Context, arg GuardedUpdate
 	row := q.db.QueryRow(ctx, guardedUpdateTaskStatus,
 		arg.NewStatus,
 		arg.Execution,
+		arg.Branch,
 		arg.WorkspaceID,
 		arg.TaskID,
 		arg.ExpectedStatus,

@@ -634,7 +634,7 @@ func runOneCycle(
 	}
 	for _, task := range tasks {
 		handle := uuid.New().String()
-		won, claimErr := orchestrator.ClaimTask(ctx, pool, wsID, task.TaskID, executorID)
+		won, claimErr := orchestrator.ClaimTask(ctx, pool, wsID, task.TaskID, task.FeatureName, task.TaskName, executorID)
 		if claimErr != nil {
 			return nil, fmt.Errorf("ClaimTask %s: %w", task.TaskName, claimErr)
 		}

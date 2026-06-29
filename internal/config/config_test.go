@@ -46,6 +46,9 @@ func TestLoad_AllPresent(t *testing.T) {
 	if cfg.PollIntervalSeconds != 15 {
 		t.Errorf("PollIntervalSeconds default = %d, want 15", cfg.PollIntervalSeconds)
 	}
+	if cfg.HealthPort != 8080 {
+		t.Errorf("HealthPort default = %d, want 8080", cfg.HealthPort)
+	}
 	if cfg.BaseBranch != "main" {
 		t.Errorf("BaseBranch default = %q, want main", cfg.BaseBranch)
 	}
@@ -80,6 +83,29 @@ func TestLoad_PollIntervalOverride(t *testing.T) {
 	}
 }
 
+func TestLoad_HealthPortOverride(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("HEALTH_PORT", "9090")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.HealthPort != 9090 {
+		t.Errorf("HealthPort = %d, want 9090", cfg.HealthPort)
+	}
+}
+
+func TestLoad_InvalidHealthPort(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("HEALTH_PORT", "not-a-number")
+
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("expected error for invalid HEALTH_PORT, got nil")
+	}
+}
+
 func TestLoad_InvalidPollInterval(t *testing.T) {
 	setAllRequired(t)
 	t.Setenv("POLL_INTERVAL_SECONDS", "not-a-number")
@@ -91,8 +117,8 @@ func TestLoad_InvalidPollInterval(t *testing.T) {
 }
 
 func TestLoad_PartialMissing(t *testing.T) {
-	os.Unsetenv("DATABASE_URL")
-	os.Unsetenv("WORKSPACE_ID")
+	_ = os.Unsetenv("DATABASE_URL")
+	_ = os.Unsetenv("WORKSPACE_ID")
 	t.Setenv("ORGANIZATION_ID", "22222222-0000-0000-0000-000000000000")
 	t.Setenv("BROKER_URL", "http://localhost:8080")
 	t.Setenv("GITHUB_TOKEN", "ghp_test")

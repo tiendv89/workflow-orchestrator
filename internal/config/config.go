@@ -17,8 +17,8 @@ type Config struct {
 	RedisURL            string
 	ManagementRepo      string
 	BaseBranch          string
-	ImplRepoURL         string
 	PollIntervalSeconds int
+	HealthPort          int
 }
 
 // Load reads configuration from environment variables. Returns an error if any
@@ -40,8 +40,6 @@ func Load() (*Config, error) {
 		cfg.BaseBranch = "main"
 	}
 
-	cfg.ImplRepoURL = os.Getenv("IMPL_REPO_URL")
-
 	cfg.PollIntervalSeconds = 15
 	if raw := os.Getenv("POLL_INTERVAL_SECONDS"); raw != "" {
 		n, err := strconv.Atoi(raw)
@@ -49,6 +47,16 @@ func Load() (*Config, error) {
 			errs = append(errs, fmt.Errorf("POLL_INTERVAL_SECONDS must be an integer: %w", err))
 		} else {
 			cfg.PollIntervalSeconds = n
+		}
+	}
+
+	cfg.HealthPort = 8080
+	if raw := os.Getenv("HEALTH_PORT"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("HEALTH_PORT must be an integer: %w", err))
+		} else {
+			cfg.HealthPort = n
 		}
 	}
 

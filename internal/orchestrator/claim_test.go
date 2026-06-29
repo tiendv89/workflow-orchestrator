@@ -67,8 +67,8 @@ func setupFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool) testFix
 	return testFixture{workspaceID: wsID, featureID: row.FeatureID}
 }
 
-// insertReadyTask inserts a task in "ready" status and returns its task_id.
-func insertReadyTask(t *testing.T, ctx context.Context, pool *pgxpool.Pool, fx testFixture) uuid.UUID {
+// insertReadyTask inserts a task in "ready" status and returns its task_id and task_name.
+func insertReadyTask(t *testing.T, ctx context.Context, pool *pgxpool.Pool, fx testFixture) (uuid.UUID, string) {
 	t.Helper()
 	q := queries.New(pool)
 	taskID := uuid.New()
@@ -91,7 +91,7 @@ func insertReadyTask(t *testing.T, ctx context.Context, pool *pgxpool.Pool, fx t
 	if err != nil {
 		t.Fatalf("insertReadyTask: %v", err)
 	}
-	return taskID
+	return taskID, taskName
 }
 
 func TestClaimTask_ConcurrencyExactlyOneWinner(t *testing.T) {
@@ -108,7 +108,8 @@ func TestClaimTask_ConcurrencyExactlyOneWinner(t *testing.T) {
 	defer database.Close(pool)
 
 	fx := setupFixture(t, ctx, pool)
-	taskID := insertReadyTask(t, ctx, pool, fx)
+	taskID, taskName := insertReadyTask(t, ctx, pool, fx)
+	const featureName = "test-feature"
 
 	const goroutines = 10
 	results := make([]bool, goroutines)
@@ -121,7 +122,7 @@ func TestClaimTask_ConcurrencyExactlyOneWinner(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			<-ready
-			won, claimErr := orchestrator.ClaimTask(ctx, pool, fx.workspaceID, taskID, "executor-"+string(rune('A'+idx)))
+			won, claimErr := orchestrator.ClaimTask(ctx, pool, fx.workspaceID, taskID, featureName, taskName, "executor-"+string(rune('A'+idx)))
 			results[idx] = won
 			errs[idx] = claimErr
 		}(i)
@@ -159,10 +160,11 @@ func TestClaimTask_AlreadyInProgress(t *testing.T) {
 	defer database.Close(pool)
 
 	fx := setupFixture(t, ctx, pool)
-	taskID := insertReadyTask(t, ctx, pool, fx)
+	taskID, taskName := insertReadyTask(t, ctx, pool, fx)
+	const featureName = "test-feature"
 
 	// First claim should win.
-	won, err := orchestrator.ClaimTask(ctx, pool, fx.workspaceID, taskID, "executor-A")
+	won, err := orchestrator.ClaimTask(ctx, pool, fx.workspaceID, taskID, featureName, taskName, "executor-A")
 	if err != nil {
 		t.Fatalf("first ClaimTask returned error: %v", err)
 	}
@@ -170,8 +172,21 @@ func TestClaimTask_AlreadyInProgress(t *testing.T) {
 		t.Fatal("first ClaimTask should have won")
 	}
 
+	wantBranch := orchestrator.TaskBranchName(featureName, taskName)
+	var gotBranch *string
+	err = pool.QueryRow(ctx,
+		`SELECT branch FROM workspace_tasks WHERE workspace_id = $1 AND task_id = $2`,
+		fx.workspaceID, taskID,
+	).Scan(&gotBranch)
+	if err != nil {
+		t.Fatalf("query branch: %v", err)
+	}
+	if gotBranch == nil || *gotBranch != wantBranch {
+		t.Errorf("branch after claim = %v, want %q", gotBranch, wantBranch)
+	}
+
 	// Second claim on a task now in "in_progress" must return (false, nil).
-	won, err = orchestrator.ClaimTask(ctx, pool, fx.workspaceID, taskID, "executor-B")
+	won, err = orchestrator.ClaimTask(ctx, pool, fx.workspaceID, taskID, featureName, taskName, "executor-B")
 	if err != nil {
 		t.Fatalf("second ClaimTask returned unexpected error: %v", err)
 	}
@@ -194,7 +209,7 @@ func TestClaimTask_DBError(t *testing.T) {
 	// Close the pool immediately to simulate a DB error.
 	pool.Close()
 
-	won, err := orchestrator.ClaimTask(ctx, pool, uuid.New(), uuid.New(), "executor-A")
+	won, err := orchestrator.ClaimTask(ctx, pool, uuid.New(), uuid.New(), "feat", "T1", "executor-A")
 	if err == nil {
 		t.Fatal("expected a database error, got nil")
 	}

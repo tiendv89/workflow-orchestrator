@@ -14,6 +14,20 @@ import (
 	db "github.com/tiendv89/workflow-orchestrator/internal/database/queries"
 )
 
+// mockDBQuerier is a test double for dbQuerier.
+type mockDBQuerier struct {
+	modelID  string
+	modelErr error
+}
+
+func (m *mockDBQuerier) GetWorkspaceRepo(_ context.Context, _ db.GetWorkspaceRepoParams) (db.WorkspaceRepo, error) {
+	return db.WorkspaceRepo{RepoURL: strPtr("git@github.com:owner/impl-repo.git")}, nil
+}
+
+func (m *mockDBQuerier) GetWorkspaceDefaultModel(_ context.Context, _ db.GetWorkspaceDefaultModelParams) (db.Model, error) {
+	return db.Model{ModelID: m.modelID}, m.modelErr
+}
+
 // mockStreamer captures StreamAdd calls for assertion.
 type mockStreamer struct {
 	mu    sync.Mutex
@@ -47,7 +61,6 @@ func newTestConfig(brokerURL string) *config.Config {
 		BrokerURL:      brokerURL,
 		ManagementRepo: "owner/repo",
 		BaseBranch:     "main",
-		ImplRepoURL:    "git@github.com:owner/impl-repo.git",
 	}
 }
 
@@ -56,7 +69,15 @@ func newTestTask() db.WorkspaceTask {
 		FeatureName: "my-feature",
 		TaskName:    "T11",
 		Branch:      strPtr("feature/my-feature-T11"),
+		Repo:        strPtr("impl-repo"),
 	}
+}
+
+// newTestDispatcher creates a Dispatcher wired with a default mockDBQuerier.
+func newTestDispatcher(brokerURL string, stream Streamer, client *http.Client) *Dispatcher {
+	d := NewDispatcher(brokerURL, stream, client, nil)
+	d.db = &mockDBQuerier{}
+	return d
 }
 
 // TestDispatch_BrokerRegistration verifies that dispatch POSTs the correct JSON
@@ -78,7 +99,7 @@ func TestDispatch_BrokerRegistration(t *testing.T) {
 	defer srv.Close()
 
 	ms := &mockStreamer{}
-	d := NewDispatcher(srv.URL, ms, srv.Client())
+	d := newTestDispatcher(srv.URL, ms, srv.Client())
 	cfg := newTestConfig(srv.URL)
 	task := newTestTask()
 
@@ -128,7 +149,7 @@ func TestDispatch_NonceConsistency(t *testing.T) {
 	defer srv.Close()
 
 	ms := &mockStreamer{}
-	d := NewDispatcher(srv.URL, ms, srv.Client())
+	d := newTestDispatcher(srv.URL, ms, srv.Client())
 	cfg := newTestConfig(srv.URL)
 	task := newTestTask()
 
@@ -166,7 +187,7 @@ func TestDispatch_StreamEntry(t *testing.T) {
 	defer srv.Close()
 
 	ms := &mockStreamer{}
-	d := NewDispatcher(srv.URL, ms, srv.Client())
+	d := newTestDispatcher(srv.URL, ms, srv.Client())
 	cfg := newTestConfig(srv.URL)
 	task := newTestTask()
 
@@ -281,7 +302,7 @@ func TestDispatch_BrokerError(t *testing.T) {
 	defer srv.Close()
 
 	ms := &mockStreamer{}
-	d := NewDispatcher(srv.URL, ms, srv.Client())
+	d := newTestDispatcher(srv.URL, ms, srv.Client())
 	cfg := newTestConfig(srv.URL)
 	task := newTestTask()
 
@@ -299,12 +320,122 @@ func TestDispatch_StreamError(t *testing.T) {
 	defer srv.Close()
 
 	ms := &mockStreamer{err: errors.New("redis: connection refused")}
-	d := NewDispatcher(srv.URL, ms, srv.Client())
+	d := newTestDispatcher(srv.URL, ms, srv.Client())
 	cfg := newTestConfig(srv.URL)
 	task := newTestTask()
 
 	err := d.Dispatch(context.Background(), cfg, task, "handle-redis-err")
 	if err == nil {
 		t.Fatal("expected error for redis failure, got nil")
+	}
+}
+
+// TestDispatch_TaskBaseBranch verifies that task_base_branch is set to
+// "feature/<featureName>" (the feature-level PR target), not the repo base branch.
+func TestDispatch_TaskBaseBranch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ms := &mockStreamer{}
+	d := newTestDispatcher(srv.URL, ms, srv.Client())
+	cfg := newTestConfig(srv.URL)
+	task := newTestTask()
+
+	if err := d.Dispatch(context.Background(), cfg, task, "handle-base-branch"); err != nil {
+		t.Fatalf("dispatch returned error: %v", err)
+	}
+
+	var job dispatchJob
+	if err := json.Unmarshal([]byte(ms.calls[0].values["job"]), &job); err != nil {
+		t.Fatalf("unmarshal job: %v", err)
+	}
+	if job.TaskBaseBranch != "feature/my-feature" {
+		t.Errorf("job.TaskBaseBranch = %q, want feature/my-feature", job.TaskBaseBranch)
+	}
+}
+
+// TestDispatch_DerivesTaskRepoBranchWhenMissing verifies dispatch still sets
+// task_repo_branch when the task row has no persisted branch (the common case
+// before claim updates the DB, or when dispatch runs on a stale in-memory task).
+func TestDispatch_DerivesTaskRepoBranchWhenMissing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ms := &mockStreamer{}
+	d := newTestDispatcher(srv.URL, ms, srv.Client())
+	cfg := newTestConfig(srv.URL)
+	task := db.WorkspaceTask{
+		FeatureName: "my-feature",
+		TaskName:    "T11",
+		Repo:        strPtr("impl-repo"),
+	}
+
+	if err := d.Dispatch(context.Background(), cfg, task, "handle-branch"); err != nil {
+		t.Fatalf("dispatch returned error: %v", err)
+	}
+
+	var job dispatchJob
+	if err := json.Unmarshal([]byte(ms.calls[0].values["job"]), &job); err != nil {
+		t.Fatalf("unmarshal job: %v", err)
+	}
+	if job.TaskRepoBranch != "feature/my-feature-T11" {
+		t.Errorf("job.TaskRepoBranch = %q, want feature/my-feature-T11", job.TaskRepoBranch)
+	}
+}
+
+
+// TestDispatch_ModelFromPolicy verifies that the dispatched job contains the model
+// returned by the workspace policy when a DB querier is configured.
+func TestDispatch_ModelFromPolicy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ms := &mockStreamer{}
+	d := newTestDispatcher(srv.URL, ms, srv.Client())
+	d.db = &mockDBQuerier{modelID: "claude-opus-4-8"}
+	cfg := newTestConfig(srv.URL)
+
+	if err := d.Dispatch(context.Background(), cfg, newTestTask(), "handle-model-policy"); err != nil {
+		t.Fatalf("dispatch returned error: %v", err)
+	}
+
+	var job dispatchJob
+	if err := json.Unmarshal([]byte(ms.calls[0].values["job"]), &job); err != nil {
+		t.Fatalf("unmarshal job: %v", err)
+	}
+	if job.ImplementationModel != "claude-opus-4-8" {
+		t.Errorf("ImplementationModel = %q, want claude-opus-4-8", job.ImplementationModel)
+	}
+}
+
+// TestDispatch_ModelFallbackOnDBError verifies that the dispatched job falls back
+// to the default model when the DB query returns an error.
+func TestDispatch_ModelFallbackOnDBError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ms := &mockStreamer{}
+	d := newTestDispatcher(srv.URL, ms, srv.Client())
+	d.db = &mockDBQuerier{modelErr: errors.New("no rows")}
+	cfg := newTestConfig(srv.URL)
+
+	if err := d.Dispatch(context.Background(), cfg, newTestTask(), "handle-model-err"); err != nil {
+		t.Fatalf("dispatch returned error: %v", err)
+	}
+
+	var job dispatchJob
+	if err := json.Unmarshal([]byte(ms.calls[0].values["job"]), &job); err != nil {
+		t.Fatalf("unmarshal job: %v", err)
+	}
+	if job.ImplementationModel != defaultImplementationModel {
+		t.Errorf("ImplementationModel = %q, want %q", job.ImplementationModel, defaultImplementationModel)
 	}
 }

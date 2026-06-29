@@ -33,7 +33,7 @@ func TestHealthzEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /healthz: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
@@ -54,7 +54,7 @@ func TestStartHealthzServer_BindError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pre-bind: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	addr := ln.Addr().String()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -171,7 +171,7 @@ func fixedHandleLC(
 		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
 			return tasks, findErr
 		},
-		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _ string) (bool, error) {
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
 			return claimWon, claimErr
 		},
 		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
@@ -221,7 +221,7 @@ func TestRunCycle_FindEligibleError(t *testing.T) {
 		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
 			return nil, errors.New("db unavailable")
 		},
-		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _ string) (bool, error) {
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
 			return false, nil
 		},
 		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
@@ -291,7 +291,7 @@ func TestRunCycle_ClaimLost(t *testing.T) {
 		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
 			return []db.WorkspaceTask{task}, nil
 		},
-		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _ string) (bool, error) {
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
 			return false, nil // claim lost
 		},
 		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
@@ -349,7 +349,7 @@ func TestRunCycle_DispatchError(t *testing.T) {
 		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
 			return []db.WorkspaceTask{task}, nil
 		},
-		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _ string) (bool, error) {
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
 			return true, nil // claim won
 		},
 		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
@@ -404,7 +404,7 @@ func TestRunCycle_HappyPath(t *testing.T) {
 		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
 			return []db.WorkspaceTask{task}, nil
 		},
-		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _ string) (bool, error) {
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
 			return true, nil
 		},
 		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
