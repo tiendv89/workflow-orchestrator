@@ -1,0 +1,7 @@
+/orchestrator
+/seed
+.env
+.vscode
+
+
+*debug*

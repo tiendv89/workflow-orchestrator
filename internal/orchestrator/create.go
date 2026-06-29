@@ -1,0 +1,154 @@
+//go:build integration
+
+package orchestrator
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/tiendv89/workflow-orchestrator/internal/database/queries"
+)
+
+// GoFeatureSpec describes a go-owned feature to be materialized into the DB.
+type GoFeatureSpec struct {
+	WorkspaceID    uuid.UUID    `json:"workspace_id"`
+	OrganizationID uuid.UUID    `json:"organization_id"`
+	Slug           string       `json:"slug"`
+	Title          string       `json:"title"`
+	Tasks          []GoTaskSpec `json:"tasks"`
+}
+
+// GoTaskSpec describes a single task within a go-owned feature.
+type GoTaskSpec struct {
+	Name      string   `json:"name"`
+	Title     string   `json:"title"`
+	Repo      string   `json:"repo"`
+	DependsOn []string `json:"depends_on"`
+	ActorType string   `json:"actor_type"`
+}
+
+const ownerGo = "go"
+
+// CreateFeature inserts a go-owned feature into workspace_features and returns
+// the auto-generated feature_id UUID. db may be *pgxpool.Pool or pgx.Tx.
+func CreateFeature(ctx context.Context, db queries.DBTX, spec GoFeatureSpec) (uuid.UUID, error) {
+	q := queries.New(db)
+	featureID := uuid.New()
+	owner := ownerGo
+	status := "in_design"
+	stage := "product_spec"
+
+	row, err := q.InsertFeature(ctx, queries.InsertFeatureParams{
+		WorkspaceID:   spec.WorkspaceID,
+		FeatureID:     featureID,
+		FeatureName:   spec.Slug,
+		Title:         spec.Title,
+		FeatureStatus: &status,
+		CurrentStage:  &stage,
+		SourcePath:    nil,
+		Owner:         &owner,
+	})
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("CreateFeature: insert failed: %w", err)
+	}
+	return row.FeatureID, nil
+}
+
+// CreateTask inserts a go-owned task into workspace_tasks and returns the
+// auto-generated task_id UUID. actor_type is persisted into the execution JSONB
+// column as {"actor_type": "<value>"}. db may be *pgxpool.Pool or pgx.Tx.
+func CreateTask(ctx context.Context, db queries.DBTX, featureID uuid.UUID, featureSlug string, workspaceID uuid.UUID, t GoTaskSpec) (uuid.UUID, error) {
+	q := queries.New(db)
+	taskID := uuid.New()
+	owner := ownerGo
+	status := "todo"
+
+	dependsOnJSON, err := json.Marshal(t.DependsOn)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("CreateTask: marshal depends_on: %w", err)
+	}
+
+	executionJSON, err := json.Marshal(map[string]string{"actor_type": t.ActorType})
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("CreateTask: marshal execution: %w", err)
+	}
+
+	var repo *string
+	if t.Repo != "" {
+		r := t.Repo
+		repo = &r
+	}
+
+	row, err := q.InsertTask(ctx, queries.InsertTaskParams{
+		WorkspaceID: workspaceID,
+		FeatureID:   featureID,
+		FeatureName: featureSlug,
+		TaskID:      taskID,
+		TaskName:    t.Name,
+		Title:       t.Title,
+		Repo:        repo,
+		Status:      &status,
+		DependsOn:   dependsOnJSON,
+		Branch:      nil,
+		SourcePath:  nil,
+		Owner:       &owner,
+		Execution:   executionJSON,
+	})
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("CreateTask %s: insert failed: %w", t.Name, err)
+	}
+	return row.TaskID, nil
+}
+
+// InitialAutoReady advances tasks with an empty depends_on to status='ready'.
+// This mirrors the auto-ready rule applied at feature-seed time.
+// db may be *pgxpool.Pool or pgx.Tx.
+func InitialAutoReady(ctx context.Context, db queries.DBTX, workspaceID, featureID uuid.UUID) error {
+	_, err := db.Exec(ctx, `
+		UPDATE workspace_tasks
+		SET    status     = 'ready',
+		       updated_at = now()
+		WHERE  workspace_id = $1
+		  AND  feature_id   = $2
+		  AND  depends_on   = '[]'::jsonb
+		  AND  status       = 'todo'
+	`, workspaceID, featureID)
+	if err != nil {
+		return fmt.Errorf("InitialAutoReady: %w", err)
+	}
+	return nil
+}
+
+// MaterializeFeature creates a feature and all its tasks in a single transaction,
+// then seeds status='ready' for tasks that have no dependencies.
+func MaterializeFeature(ctx context.Context, pool *pgxpool.Pool, spec GoFeatureSpec) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("MaterializeFeature: begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	featureID, err := CreateFeature(ctx, tx, spec)
+	if err != nil {
+		return fmt.Errorf("MaterializeFeature: %w", err)
+	}
+
+	for _, t := range spec.Tasks {
+		if _, err := CreateTask(ctx, tx, featureID, spec.Slug, spec.WorkspaceID, t); err != nil {
+			return fmt.Errorf("MaterializeFeature: %w", err)
+		}
+	}
+
+	if err := InitialAutoReady(ctx, tx, spec.WorkspaceID, featureID); err != nil {
+		return fmt.Errorf("MaterializeFeature: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("MaterializeFeature: commit: %w", err)
+	}
+	return nil
+}

@@ -1,0 +1,24 @@
+services:
+  go-orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      WORKSPACE_ID: ${WORKSPACE_ID}
+      ORGANIZATION_ID: ${ORGANIZATION_ID}
+      BROKER_URL: ${BROKER_URL}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      REDIS_URL: ${REDIS_URL}
+      MANAGEMENT_REPO: ${MANAGEMENT_REPO}
+      BASE_BRANCH: ${BASE_BRANCH:-main}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-15}
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
