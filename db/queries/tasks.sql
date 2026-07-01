@@ -255,3 +255,41 @@ FROM workspace_tasks
 WHERE workspace_id = $1
   AND owner        = 'go'
   AND (status IN ('in_progress', 'reviewing') OR conflict_state = 'resolving');
+
+-- name: ListChangeRequestedTasksForOwner :many
+-- Returns go-owned tasks in change_requested status with a PR URL set.
+-- Used by the fix-loop dispatcher to find tasks needing a fix agent.
+SELECT
+    id, workspace_id, feature_id, feature_name, task_id, task_name, title,
+    repo, status, depends_on, blocked_reason, blocked_details, branch,
+    execution, pr, workspace_pr, source_path, source_hash, owner,
+    dispatch_handle, dispatch_nonce, dispatched_at, reenqueue_attempts,
+    dispatch_kind, review_incomplete_count, max_turns_retry_count,
+    rebase_attempts, conflict_state, blocked_from_status, created_at, updated_at
+FROM workspace_tasks
+WHERE workspace_id = $1
+  AND owner        = $2
+  AND status       = 'change_requested'
+  AND pr           IS NOT NULL
+  AND pr->>'url'   IS NOT NULL
+ORDER BY updated_at ASC;
+
+-- name: ListMergeablePRTasksForOwner :many
+-- Returns go-owned tasks in in_review, reviewing, or review_passed status
+-- that have a PR URL. Used by PollMergedPRs to detect merged PRs (ground truth).
+-- Covers the reviewer-auto-merge race: a PR can be merged while the task is
+-- still 'reviewing' (verdict not yet reaped).
+SELECT
+    id, workspace_id, feature_id, feature_name, task_id, task_name, title,
+    repo, status, depends_on, blocked_reason, blocked_details, branch,
+    execution, pr, workspace_pr, source_path, source_hash, owner,
+    dispatch_handle, dispatch_nonce, dispatched_at, reenqueue_attempts,
+    dispatch_kind, review_incomplete_count, max_turns_retry_count,
+    rebase_attempts, conflict_state, blocked_from_status, created_at, updated_at
+FROM workspace_tasks
+WHERE workspace_id = $1
+  AND owner        = $2
+  AND status       IN ('in_review', 'reviewing', 'review_passed')
+  AND pr           IS NOT NULL
+  AND pr->>'url'   IS NOT NULL
+ORDER BY updated_at ASC;

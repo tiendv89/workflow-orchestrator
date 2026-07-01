@@ -19,7 +19,9 @@ func makeCompletionResponse(records []completionRecord) []byte {
 	return b
 }
 
-// fakeTransition captures calls to SetInReview / SetBlocked / SetReadyFromMaxTurns.
+// fakeTransition captures calls to SetInReview / SetBlocked / SetReadyFromMaxTurns
+// and the verdict routing functions added by T7 (SetReviewPassed,
+// SetChangeRequested, HandleNoVerdict).
 type fakeTransition struct {
 	mu            sync.Mutex
 	inReviewCalls []struct {
@@ -37,6 +39,19 @@ type fakeTransition struct {
 		workspaceID uuid.UUID
 		taskUUID    uuid.UUID
 	}
+	reviewPassedCalls []struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}
+	changeRequestedCalls []struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}
+	noVerdictCalls []struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+		max         int
+	}
 	logCalls []struct {
 		action string
 		note   string
@@ -44,6 +59,7 @@ type fakeTransition struct {
 	slowLookupResult *HandleEntry
 	slowLookupErr    error
 	maxTurnsCount    int32 // returned by getMaxTurnsCount
+	noVerdictReturns bool  // controls HandleNoVerdict return (default true)
 }
 
 func (f *fakeTransition) setInReview(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, prURL string) (bool, error) {
@@ -85,6 +101,37 @@ func (f *fakeTransition) getMaxTurnsCount(_ context.Context, _ *pgxpool.Pool, _,
 	return f.maxTurnsCount, nil
 }
 
+func (f *fakeTransition) setReviewPassed(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reviewPassedCalls = append(f.reviewPassedCalls, struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}{workspaceID, taskUUID})
+	return true, nil
+}
+
+func (f *fakeTransition) setChangeRequested(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.changeRequestedCalls = append(f.changeRequestedCalls, struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}{workspaceID, taskUUID})
+	return true, nil
+}
+
+func (f *fakeTransition) handleNoVerdict(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, max int) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.noVerdictCalls = append(f.noVerdictCalls, struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+		max         int
+	}{workspaceID, taskUUID, max})
+	return true, nil
+}
+
 func (f *fakeTransition) lookupBySlug(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID, _, _ string) (*HandleEntry, error) {
 	return f.slowLookupResult, f.slowLookupErr
 }
@@ -109,8 +156,12 @@ func newTestReaperWithRetries(srv *httptest.Server, ft *fakeTransition, executor
 	return &Reaper{
 		brokerURL:          srv.URL,
 		httpClient:         srv.Client(),
+		maxReviewIncompls:  MaxReviewIncompletes,
 		setInReview:        ft.setInReview,
 		setBlocked:         ft.setBlocked,
+		setReviewPassed:    ft.setReviewPassed,
+		setChangeRequested: ft.setChangeRequested,
+		handleNoVerdict:    ft.handleNoVerdict,
 		setReadyMaxTurns:   ft.setReadyMaxTurns,
 		getMaxTurnsCount:   ft.getMaxTurnsCount,
 		slowLookup:         ft.lookupBySlug,

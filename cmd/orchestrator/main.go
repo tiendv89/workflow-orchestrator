@@ -86,6 +86,18 @@ func main() {
 		dispatch: func(ctx context.Context, c *config.Config, task db.WorkspaceTask, handle string) error {
 			return dispatcher.Dispatch(ctx, c, task, handle)
 		},
+		findReviewable: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error) {
+			return orchestrator.FindReviewableTasks(ctx, pool, wsID)
+		},
+		dispatchReviewer: func(ctx context.Context, pool *pgxpool.Pool, c *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error) {
+			return orchestrator.DispatchReviewer(ctx, pool, c, wsID, task, dispatcher, hs)
+		},
+		findFixable: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error) {
+			return orchestrator.FindFixableTasks(ctx, pool, wsID)
+		},
+		dispatchFix: func(ctx context.Context, pool *pgxpool.Pool, c *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error) {
+			return orchestrator.DispatchFix(ctx, pool, c, wsID, task, dispatcher, hs)
+		},
 		reapCompleted: func(ctx context.Context, c *config.Config, pool *pgxpool.Pool, hs *orchestrator.HandleStore) error {
 			return orchestrator.ReapCompleted(ctx, c, pool, hs)
 		},
@@ -150,14 +162,18 @@ func (s *pollState) next(hadError bool) time.Duration {
 // loopConfig holds injectable functions for each step of the poll cycle.
 // Production code wires real implementations; tests inject stubs.
 type loopConfig struct {
-	findEligible   func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
-	claimTask      func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, featureName, taskName, executor string) (bool, error)
-	rollbackClaim  func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID) (bool, error)
-	dispatch       func(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error
-	reapCompleted  func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, hs *orchestrator.HandleStore) error
-	reconcileStuck func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool) error
-	pollMergedPRs  func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error
-	newHandle      func() uuid.UUID
+	findEligible     func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
+	claimTask        func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, featureName, taskName, executor string) (bool, error)
+	rollbackClaim    func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID) (bool, error)
+	dispatch         func(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error
+	findReviewable   func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
+	dispatchReviewer func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error)
+	findFixable      func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
+	dispatchFix      func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error)
+	reapCompleted    func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, hs *orchestrator.HandleStore) error
+	reconcileStuck   func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool) error
+	pollMergedPRs    func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error
+	newHandle        func() uuid.UUID
 }
 
 // runCycle executes one full poll iteration. Each step's errors are logged and
@@ -219,13 +235,61 @@ func runCycle(
 		}
 	}
 
-	// Step b: reap completed tasks from the broker.
+	// Step b: find reviewable tasks and dispatch a reviewer for each.
+	reviewable, err := lc.findReviewable(ctx, pool, workspaceID)
+	if err != nil {
+		log.Error().Err(err).Msg("poll: FindReviewableTasks")
+		hadError = true
+	} else {
+		for _, task := range reviewable {
+			won, reviewErr := lc.dispatchReviewer(ctx, pool, cfg, workspaceID, task, hs)
+			if reviewErr != nil {
+				log.Error().Err(reviewErr).Str("task", task.TaskName).Msg("poll: DispatchReviewer error")
+				hadError = true
+				continue
+			}
+			if !won {
+				log.Debug().Str("task", task.TaskName).Msg("poll: reviewer claim lost — another instance won")
+				continue
+			}
+			log.Info().
+				Str("task", task.TaskName).
+				Str("feature", task.FeatureName).
+				Msg("poll: reviewer dispatched")
+		}
+	}
+
+	// Step c: find change_requested tasks and dispatch a fix agent for each.
+	fixable, err := lc.findFixable(ctx, pool, workspaceID)
+	if err != nil {
+		log.Error().Err(err).Msg("poll: FindFixableTasks")
+		hadError = true
+	} else {
+		for _, task := range fixable {
+			won, fixErr := lc.dispatchFix(ctx, pool, cfg, workspaceID, task, hs)
+			if fixErr != nil {
+				log.Error().Err(fixErr).Str("task", task.TaskName).Msg("poll: DispatchFix error")
+				hadError = true
+				continue
+			}
+			if !won {
+				log.Debug().Str("task", task.TaskName).Msg("poll: fix claim lost — another instance won")
+				continue
+			}
+			log.Info().
+				Str("task", task.TaskName).
+				Str("feature", task.FeatureName).
+				Msg("poll: fix agent dispatched")
+		}
+	}
+
+	// Step d: reap completed tasks from the broker.
 	if err := lc.reapCompleted(ctx, cfg, pool, hs); err != nil {
 		log.Error().Err(err).Msg("poll: ReapCompleted error")
 		hadError = true
 	}
 
-	// Step c: reconcile stuck dispatches (crash/timeout recovery).
+	// Step e: reconcile stuck dispatches (crash/timeout recovery).
 	if lc.reconcileStuck != nil {
 		if err := lc.reconcileStuck(ctx, cfg, pool); err != nil {
 			log.Error().Err(err).Msg("poll: ReconcileStuck error")
@@ -233,7 +297,7 @@ func runCycle(
 		}
 	}
 
-	// Step d: poll GitHub for merged PRs.
+	// Step f: poll GitHub for merged PRs (ground truth for done transitions).
 	if err := lc.pollMergedPRs(ctx, pool, workspaceID); err != nil {
 		log.Error().Err(err).Msg("poll: PollMergedPRs error")
 		hadError = true
