@@ -38,7 +38,7 @@ type Reaper struct {
 	brokerURL   string
 	httpClient  *http.Client
 	setInReview func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, prURL string) (bool, error)
-	setBlocked  func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, reason string) (bool, error)
+	setBlocked  func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, reason, fromStatus string) (bool, error)
 	slowLookup  func(ctx context.Context, pool *pgxpool.Pool, workspaceID uuid.UUID, featureName, taskName string) (*HandleEntry, error)
 	appendLog   func(ctx context.Context, pool *pgxpool.Pool, workspaceID, featureUUID, taskUUID uuid.UUID, action, by, note string) error
 }
@@ -51,10 +51,22 @@ func newReaper(brokerURL string, httpClient *http.Client) *Reaper {
 		brokerURL:   brokerURL,
 		httpClient:  httpClient,
 		setInReview: SetInReview,
-		setBlocked:  SetBlocked,
-		slowLookup:  dbLookupTaskBySlug,
-		appendLog:   AppendLog,
+		setBlocked: func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, reason, fromStatus string) (bool, error) {
+			return SetBlockedWithDetails(ctx, pool, workspaceID, taskUUID, reason, "", fromStatus)
+		},
+		slowLookup: dbLookupTaskBySlug,
+		appendLog:  AppendLog,
 	}
+}
+
+// blockedFromStatusForKind returns the pre-block task status given a dispatch kind.
+// impl/fix/rebase dispatch: task was in "in_progress" before dispatch.
+// review dispatch: task was in "reviewing" before dispatch.
+func blockedFromStatusForKind(kind string) string {
+	if kind == "review" {
+		return "reviewing"
+	}
+	return "in_progress"
 }
 
 // ReapCompleted drains up to 50 go-owned completions from the broker and applies
@@ -189,7 +201,8 @@ func (r *Reaper) processOne(
 			return fmt.Errorf("SetInReview handle=%q: %w", c.Handle, err)
 		}
 	case "blocked":
-		if _, err := r.setBlocked(ctx, pool, workspaceUUID, entry.TaskUUID, c.Result.BlockedReason); err != nil {
+		fromStatus := blockedFromStatusForKind(c.Metadata.Kind)
+		if _, err := r.setBlocked(ctx, pool, workspaceUUID, entry.TaskUUID, c.Result.BlockedReason, fromStatus); err != nil {
 			return fmt.Errorf("SetBlocked handle=%q: %w", c.Handle, err)
 		}
 	default:
