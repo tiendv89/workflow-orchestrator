@@ -167,6 +167,42 @@ func TestSetInReview_Success(t *testing.T) {
 	if row.DispatchNonce != nil {
 		t.Errorf("expected dispatch_nonce=nil after SetInReview, got %v", *row.DispatchNonce)
 	}
+
+	// max_turns_retry_count must be reset to 0 on every successful completion
+	if row.MaxTurnsRetryCount != 0 {
+		t.Errorf("expected max_turns_retry_count=0 after SetInReview, got %d", row.MaxTurnsRetryCount)
+	}
+}
+
+// TestSetInReview_ResetsMaxTurnsCounter verifies the reset contract when
+// the task has accumulated max-turns retries from prior execution attempts.
+func TestSetInReview_ResetsMaxTurnsCounter(t *testing.T) {
+	ctx := context.Background()
+	pool := openPool(t)
+	fx := setupFixture(t, ctx, pool)
+	taskID := insertTaskWithStatus(t, ctx, pool, fx, "in_progress")
+
+	// Simulate two prior max-turns events by directly setting the counter.
+	_, err := pool.Exec(ctx,
+		`UPDATE workspace_tasks SET max_turns_retry_count = 2
+		 WHERE workspace_id = $1 AND task_id = $2`,
+		fx.workspaceID, taskID,
+	)
+	if err != nil {
+		t.Fatalf("setup max_turns_retry_count: %v", err)
+	}
+
+	ok, err := orchestrator.SetInReview(ctx, pool, fx.workspaceID, taskID, "https://github.com/example/pr/3")
+	if err != nil {
+		t.Fatalf("SetInReview returned error: %v", err)
+	}
+	if !ok {
+		t.Error("expected ok=true")
+	}
+	row := getTaskRow(t, ctx, pool, fx, taskID)
+	if row.MaxTurnsRetryCount != 0 {
+		t.Errorf("expected max_turns_retry_count reset to 0 after successful completion, got %d", row.MaxTurnsRetryCount)
+	}
 }
 
 func TestSetInReview_WrongPrecondition(t *testing.T) {
@@ -563,5 +599,132 @@ func TestSetDone_WrongPrecondition(t *testing.T) {
 	}
 	if ok {
 		t.Error("expected ok=false for wrong precondition")
+	}
+}
+
+func TestSetReadyFromMaxTurns_Success(t *testing.T) {
+	ctx := context.Background()
+	pool := openPool(t)
+	fx := setupFixture(t, ctx, pool)
+	taskID := insertTaskWithStatus(t, ctx, pool, fx, "in_progress")
+
+	ok, err := orchestrator.SetReadyFromMaxTurns(ctx, pool, fx.workspaceID, taskID)
+	if err != nil {
+		t.Fatalf("SetReadyFromMaxTurns returned error: %v", err)
+	}
+	if !ok {
+		t.Error("expected ok=true")
+	}
+	row := getTaskRow(t, ctx, pool, fx, taskID)
+	if row.Status == nil || *row.Status != "ready" {
+		t.Errorf("expected status=ready, got %v", row.Status)
+	}
+	if row.MaxTurnsRetryCount != 1 {
+		t.Errorf("expected max_turns_retry_count=1 after first retry, got %d", row.MaxTurnsRetryCount)
+	}
+	// dispatch columns should be cleared
+	if row.DispatchHandle != nil {
+		t.Errorf("expected dispatch_handle=nil, got %v", *row.DispatchHandle)
+	}
+	if row.DispatchNonce != nil {
+		t.Errorf("expected dispatch_nonce=nil, got %v", *row.DispatchNonce)
+	}
+}
+
+func TestSetReadyFromMaxTurns_Accumulates(t *testing.T) {
+	ctx := context.Background()
+	pool := openPool(t)
+	fx := setupFixture(t, ctx, pool)
+	taskID := insertTaskWithStatus(t, ctx, pool, fx, "in_progress")
+
+	// Two max-turns resets: counter should reach 2.
+	if _, err := orchestrator.SetReadyFromMaxTurns(ctx, pool, fx.workspaceID, taskID); err != nil {
+		t.Fatalf("first SetReadyFromMaxTurns: %v", err)
+	}
+	// Re-claim (ready → in_progress) to allow a second reset.
+	if _, err := orchestrator.GuardedTransition(ctx, pool, fx.workspaceID, taskID, "ready", "in_progress", nil); err != nil {
+		t.Fatalf("re-claim: %v", err)
+	}
+	if _, err := orchestrator.SetReadyFromMaxTurns(ctx, pool, fx.workspaceID, taskID); err != nil {
+		t.Fatalf("second SetReadyFromMaxTurns: %v", err)
+	}
+
+	row := getTaskRow(t, ctx, pool, fx, taskID)
+	if row.MaxTurnsRetryCount != 2 {
+		t.Errorf("expected max_turns_retry_count=2 after two resets, got %d", row.MaxTurnsRetryCount)
+	}
+}
+
+func TestSetReadyFromMaxTurns_WrongPrecondition(t *testing.T) {
+	ctx := context.Background()
+	pool := openPool(t)
+	fx := setupFixture(t, ctx, pool)
+	taskID := insertTaskWithStatus(t, ctx, pool, fx, "ready") // not in_progress
+
+	ok, err := orchestrator.SetReadyFromMaxTurns(ctx, pool, fx.workspaceID, taskID)
+	if err != nil {
+		t.Fatalf("SetReadyFromMaxTurns returned unexpected error: %v", err)
+	}
+	if ok {
+		t.Error("expected ok=false for wrong precondition")
+	}
+}
+
+func TestBumpReenqueueAttempts_Increments(t *testing.T) {
+	ctx := context.Background()
+	pool := openPool(t)
+	fx := setupFixture(t, ctx, pool)
+	taskID := insertTaskWithStatus(t, ctx, pool, fx, "in_progress")
+
+	count1, err := orchestrator.BumpReenqueueAttempts(ctx, pool, fx.workspaceID, taskID)
+	if err != nil {
+		t.Fatalf("BumpReenqueueAttempts (1st): %v", err)
+	}
+	if count1 != 1 {
+		t.Errorf("expected count=1 after first bump, got %d", count1)
+	}
+
+	count2, err := orchestrator.BumpReenqueueAttempts(ctx, pool, fx.workspaceID, taskID)
+	if err != nil {
+		t.Fatalf("BumpReenqueueAttempts (2nd): %v", err)
+	}
+	if count2 != 2 {
+		t.Errorf("expected count=2 after second bump, got %d", count2)
+	}
+
+	row := getTaskRow(t, ctx, pool, fx, taskID)
+	if row.ReenqueueAttempts != 2 {
+		t.Errorf("expected reenqueue_attempts=2 in DB, got %d", row.ReenqueueAttempts)
+	}
+}
+
+func TestGetMaxTurnsRetryCount_ReturnsCurrentCount(t *testing.T) {
+	ctx := context.Background()
+	pool := openPool(t)
+	fx := setupFixture(t, ctx, pool)
+	taskID := insertTaskWithStatus(t, ctx, pool, fx, "in_progress")
+
+	count, err := orchestrator.GetMaxTurnsRetryCount(ctx, pool, fx.workspaceID, taskID)
+	if err != nil {
+		t.Fatalf("GetMaxTurnsRetryCount: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected initial count=0, got %d", count)
+	}
+
+	// Bump via SetReadyFromMaxTurns and re-claim to verify count reads back correctly.
+	if _, err := orchestrator.SetReadyFromMaxTurns(ctx, pool, fx.workspaceID, taskID); err != nil {
+		t.Fatalf("SetReadyFromMaxTurns: %v", err)
+	}
+	if _, err := orchestrator.GuardedTransition(ctx, pool, fx.workspaceID, taskID, "ready", "in_progress", nil); err != nil {
+		t.Fatalf("re-claim: %v", err)
+	}
+
+	count, err = orchestrator.GetMaxTurnsRetryCount(ctx, pool, fx.workspaceID, taskID)
+	if err != nil {
+		t.Fatalf("GetMaxTurnsRetryCount after bump: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected count=1 after one reset, got %d", count)
 	}
 }

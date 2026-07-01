@@ -268,14 +268,17 @@ func (r *Reaper) handleMaxTurns(
 	}
 
 	if int(count) < r.executorMaxRetries {
-		if _, err := r.setReadyMaxTurns(ctx, pool, workspaceUUID, taskUUID); err != nil {
+		ok, err := r.setReadyMaxTurns(ctx, pool, workspaceUUID, taskUUID)
+		if err != nil {
 			return fmt.Errorf("SetReadyFromMaxTurns handle=%q: %w", handle, err)
 		}
-		log.Info().
-			Str("handle", handle).
-			Int32("retry", count+1).
-			Int("max", r.executorMaxRetries).
-			Msg("reap: max-turns reset — task returned to ready")
+		if ok {
+			log.Info().
+				Str("handle", handle).
+				Int32("retry", count+1).
+				Int("max", r.executorMaxRetries).
+				Msg("reap: max-turns reset — task returned to ready")
+		}
 		return nil
 	}
 
