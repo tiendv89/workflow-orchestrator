@@ -1,4 +1,5 @@
 -- name: GetTaskByUUID :one
+-- Returns the full task row including all dispatch/conflict/counter columns.
 SELECT
     id,
     workspace_id,
@@ -11,6 +12,7 @@ SELECT
     status,
     depends_on,
     blocked_reason,
+    blocked_details,
     branch,
     execution,
     pr,
@@ -18,6 +20,16 @@ SELECT
     source_path,
     source_hash,
     owner,
+    dispatch_handle,
+    dispatch_nonce,
+    dispatched_at,
+    reenqueue_attempts,
+    dispatch_kind,
+    review_incomplete_count,
+    max_turns_retry_count,
+    rebase_attempts,
+    conflict_state,
+    blocked_from_status,
     created_at,
     updated_at
 FROM workspace_tasks
@@ -96,6 +108,7 @@ SELECT
     status,
     depends_on,
     blocked_reason,
+    blocked_details,
     branch,
     execution,
     pr,
@@ -103,6 +116,16 @@ SELECT
     source_path,
     source_hash,
     owner,
+    dispatch_handle,
+    dispatch_nonce,
+    dispatched_at,
+    reenqueue_attempts,
+    dispatch_kind,
+    review_incomplete_count,
+    max_turns_retry_count,
+    rebase_attempts,
+    conflict_state,
+    blocked_from_status,
     created_at,
     updated_at
 FROM workspace_tasks
@@ -111,8 +134,8 @@ WHERE workspace_id = $1
 ORDER BY task_name;
 
 -- name: ListInReviewTasksForOwner :many
--- Returns tasks in 'in_review' state for a given owner (e.g. 'go').
--- Used by the PR-merge poll (T13).
+-- Returns tasks in 'in_review' or 'review_incomplete' state for a given owner (e.g. 'go').
+-- Used by the PR-merge poll and reviewer dispatch.
 SELECT
     id,
     workspace_id,
@@ -125,6 +148,7 @@ SELECT
     status,
     depends_on,
     blocked_reason,
+    blocked_details,
     branch,
     execution,
     pr,
@@ -132,9 +156,102 @@ SELECT
     source_path,
     source_hash,
     owner,
+    dispatch_handle,
+    dispatch_nonce,
+    dispatched_at,
+    reenqueue_attempts,
+    dispatch_kind,
+    review_incomplete_count,
+    max_turns_retry_count,
+    rebase_attempts,
+    conflict_state,
+    blocked_from_status,
     created_at,
     updated_at
 FROM workspace_tasks
 WHERE workspace_id = $1
   AND owner        = $2
   AND status       = 'in_review';
+
+-- name: ListReviewableTasksForOwner :many
+-- Returns tasks eligible for reviewer dispatch: in_review (new) or review_incomplete (retry).
+-- Both must have a PR URL set (pr->>'url' is non-null) and not be already reviewing.
+SELECT
+    id,
+    workspace_id,
+    feature_id,
+    feature_name,
+    task_id,
+    task_name,
+    title,
+    repo,
+    status,
+    depends_on,
+    blocked_reason,
+    blocked_details,
+    branch,
+    execution,
+    pr,
+    workspace_pr,
+    source_path,
+    source_hash,
+    owner,
+    dispatch_handle,
+    dispatch_nonce,
+    dispatched_at,
+    reenqueue_attempts,
+    dispatch_kind,
+    review_incomplete_count,
+    max_turns_retry_count,
+    rebase_attempts,
+    conflict_state,
+    blocked_from_status,
+    created_at,
+    updated_at
+FROM workspace_tasks
+WHERE workspace_id = $1
+  AND owner        = $2
+  AND status       IN ('in_review', 'review_incomplete')
+  AND pr           IS NOT NULL
+  AND pr->>'url'   IS NOT NULL
+ORDER BY updated_at ASC;
+
+-- name: ListInProgressAndReviewingForOwner :many
+-- Returns dispatched go-owned tasks for the reconciler and soft-claim count.
+-- Covers both the task-dispatch half (in_progress/reviewing) and conflict-rebase (resolving).
+SELECT
+    id,
+    workspace_id,
+    feature_id,
+    feature_name,
+    task_id,
+    task_name,
+    title,
+    repo,
+    status,
+    depends_on,
+    blocked_reason,
+    blocked_details,
+    branch,
+    execution,
+    pr,
+    workspace_pr,
+    source_path,
+    source_hash,
+    owner,
+    dispatch_handle,
+    dispatch_nonce,
+    dispatched_at,
+    reenqueue_attempts,
+    dispatch_kind,
+    review_incomplete_count,
+    max_turns_retry_count,
+    rebase_attempts,
+    conflict_state,
+    blocked_from_status,
+    created_at,
+    updated_at
+FROM workspace_tasks
+WHERE workspace_id = $1
+  AND owner        = 'go'
+  AND (status IN ('in_progress', 'reviewing') OR conflict_state = 'resolving');

@@ -387,7 +387,6 @@ func TestDispatch_DerivesTaskRepoBranchWhenMissing(t *testing.T) {
 	}
 }
 
-
 // TestDispatch_ModelFromPolicy verifies that the dispatched job contains the model
 // returned by the workspace policy when a DB querier is configured.
 func TestDispatch_ModelFromPolicy(t *testing.T) {
