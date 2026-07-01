@@ -145,17 +145,20 @@ RETURNING id`
 	return true, nil
 }
 
-// FindConflictedHandoffPRs returns open handoff_prs with conflict_state='conflicted'.
-func FindConflictedHandoffPRs(ctx context.Context, pool *pgxpool.Pool) ([]db.HandoffPr, error) {
+// FindConflictedHandoffPRs returns open handoff_prs with conflict_state='conflicted'
+// whose rebase_attempts is below the cap. PRs at or above the cap are excluded so
+// DispatchHandoffPRRebase stops re-dispatching them after the cap is reached.
+func FindConflictedHandoffPRs(ctx context.Context, pool *pgxpool.Pool, maxRebaseAttempts int) ([]db.HandoffPr, error) {
 	const sql = `
 SELECT id, handoff_id, repo, pr_url, status, conflict_state, rebase_attempts,
        dispatch_handle, dispatch_nonce, dispatched_at, reenqueue_attempts, created_at
 FROM handoff_prs
-WHERE conflict_state = 'conflicted'
-  AND status         = 'open'
+WHERE conflict_state   = 'conflicted'
+  AND status           = 'open'
+  AND rebase_attempts  < $1
 ORDER BY created_at ASC`
 
-	rows, err := pool.Query(ctx, sql)
+	rows, err := pool.Query(ctx, sql, maxRebaseAttempts)
 	if err != nil {
 		return nil, fmt.Errorf("FindConflictedHandoffPRs: %w", err)
 	}

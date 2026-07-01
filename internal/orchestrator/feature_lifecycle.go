@@ -170,13 +170,17 @@ func TriggerHandoff(
 		FeatureID:   featureID,
 	})
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// ON CONFLICT DO NOTHING fired — another instance already created the handoff.
+			log.Debug().
+				Str("feature", featureName).
+				Msg("TriggerHandoff: handoff row already exists — skipping (another instance won)")
+			return nil
+		}
 		return fmt.Errorf("TriggerHandoff: InsertHandoff: %w", err)
 	}
 	if handoff == nil {
-		// Another instance already created the handoff — skip.
-		log.Debug().
-			Str("feature", featureName).
-			Msg("TriggerHandoff: handoff row already exists — skipping (another instance won)")
+		// Safety guard: should not reach here since ErrNoRows is handled above.
 		return nil
 	}
 
@@ -382,7 +386,7 @@ func createMgmtHandoffPR(
 	body := fmt.Sprintf("Management-repo status PR for handoff of feature `%s`.\n\nMerges `%s` → `%s`.",
 		featureName, featureBranch, cfg.BaseBranch)
 
-	url, err := ghCreator.CreatePR(ctx, cfg.ManagementRepo, featureBranch, cfg.BaseBranch, title, body, true)
+	url, err := ghCreator.CreatePR(ctx, cfg.ManagementRepo, featureBranch, cfg.BaseBranch, title, body, false)
 	if err != nil {
 		return "", fmt.Errorf("createMgmtHandoffPR: %w", err)
 	}

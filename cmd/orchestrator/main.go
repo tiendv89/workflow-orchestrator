@@ -120,8 +120,8 @@ func main() {
 		pollHandoffPRs: func(ctx context.Context, pool *pgxpool.Pool) error {
 			return orchestrator.PollHandoffPRs(ctx, ghClient, pool)
 		},
-		findConflictedHandoffPRs: func(ctx context.Context, pool *pgxpool.Pool) ([]db.HandoffPr, error) {
-			return orchestrator.FindConflictedHandoffPRs(ctx, pool)
+		findConflictedHandoffPRs: func(ctx context.Context, pool *pgxpool.Pool, maxRebaseAttempts int) ([]db.HandoffPr, error) {
+			return orchestrator.FindConflictedHandoffPRs(ctx, pool, maxRebaseAttempts)
 		},
 		dispatchHandoffPRRebase: func(ctx context.Context, pool *pgxpool.Pool, c *config.Config, wsID uuid.UUID, pr db.HandoffPr, hs *orchestrator.HandleStore) (bool, error) {
 			return orchestrator.DispatchHandoffPRRebase(ctx, c, pool, hs, dispatcher, wsID, pr)
@@ -200,7 +200,7 @@ type loopConfig struct {
 	// Feature lifecycle + handoff (HIGH priority, run before task dispatch).
 	runFeatureLifecycle        func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID) error
 	pollHandoffPRs             func(ctx context.Context, pool *pgxpool.Pool) error
-	findConflictedHandoffPRs   func(ctx context.Context, pool *pgxpool.Pool) ([]db.HandoffPr, error)
+	findConflictedHandoffPRs   func(ctx context.Context, pool *pgxpool.Pool, maxRebaseAttempts int) ([]db.HandoffPr, error)
 	dispatchHandoffPRRebase    func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, pr db.HandoffPr, hs *orchestrator.HandleStore) (bool, error)
 	checkAndFinalizeHandoffs   func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error
 }
@@ -239,7 +239,7 @@ func runCycle(
 
 	// Step 0c: dispatch handoff-PR rebases for conflicted handoff PRs (HIGH priority).
 	if lc.findConflictedHandoffPRs != nil && lc.dispatchHandoffPRRebase != nil {
-		conflictedHPRs, err := lc.findConflictedHandoffPRs(ctx, pool)
+		conflictedHPRs, err := lc.findConflictedHandoffPRs(ctx, pool, cfg.MaxRebaseAttempts)
 		if err != nil {
 			log.Error().Err(err).Msg("poll: FindConflictedHandoffPRs error")
 			hadError = true
