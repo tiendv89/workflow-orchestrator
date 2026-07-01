@@ -234,6 +234,53 @@ func (d *Dispatcher) getRepoURL(
 	return *repo.RepoURL, nil
 }
 
+// EnqueueExisting re-sends an existing dispatch job to the Redis stream using
+// the provided handle, nonce, and kind. It does NOT re-register with the broker
+// — the broker already holds the handle from the original Dispatch call.
+//
+// This is the reconciler path: after a crash the task still has its original
+// dispatch_handle/nonce in the DB; EnqueueExisting replays the stream entry so
+// the executor picks it up again. On Redis failure the error is returned to the
+// caller (reconciler logs and skips — no task block).
+func (d *Dispatcher) EnqueueExisting(
+	ctx context.Context,
+	cfg *config.Config,
+	task db.WorkspaceTask,
+	handle, nonce, kind string,
+) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	branch := ResolveTaskBranch(task)
+	repoURL, err := d.getRepoURL(ctx, cfg, task)
+	if err != nil {
+		return fmt.Errorf("EnqueueExisting: get repo URL: %w", err)
+	}
+
+	job := dispatchJob{
+		Handle:             handle,
+		Nonce:              nonce,
+		Kind:               kind,
+		TaskID:             task.TaskName,
+		FeatureID:          task.FeatureName,
+		WorkspaceID:        cfg.WorkspaceID,
+		TaskRepoURL:        repoURL,
+		TaskRepoBranch:     branch,
+		TaskBaseBranch:     FeatureBranchName(task.FeatureName),
+		TaskRepoBaseBranch: cfg.BaseBranch,
+		MgmtRepoURL:        cfg.ManagementRepo,
+		CallbackURL:        cfg.BrokerURL + "/callback",
+		EnqueuedAt:         now,
+	}
+
+	payload, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("EnqueueExisting: marshal: %w", err)
+	}
+
+	return d.stream.StreamAdd(ctx, "platform:dispatch", map[string]string{
+		"job": string(payload),
+	})
+}
+
 func (d *Dispatcher) getModelID(ctx context.Context, workspaceID string) string {
 	if d.db == nil {
 		return defaultImplementationModel

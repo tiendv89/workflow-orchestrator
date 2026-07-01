@@ -55,6 +55,47 @@ func TestLoad_AllPresent(t *testing.T) {
 	if cfg.ManagementRepo != "tiendv89/project-workspace" {
 		t.Errorf("ManagementRepo = %q", cfg.ManagementRepo)
 	}
+	// error/stuck recovery defaults
+	if cfg.ExecutionDeadlineMS != 7200000 {
+		t.Errorf("ExecutionDeadlineMS default = %d, want 7200000", cfg.ExecutionDeadlineMS)
+	}
+	if cfg.DispatchReconcileMaxRetries != 3 {
+		t.Errorf("DispatchReconcileMaxRetries default = %d, want 3", cfg.DispatchReconcileMaxRetries)
+	}
+	if cfg.ExecutorMaxRetries != 3 {
+		t.Errorf("ExecutorMaxRetries default = %d, want 3", cfg.ExecutorMaxRetries)
+	}
+}
+
+func TestLoad_RecoveryConfigOverrides(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("EXECUTION_DEADLINE_MS", "3600000")
+	t.Setenv("DISPATCH_RECONCILE_MAX_RETRIES", "5")
+	t.Setenv("EXECUTOR_MAX_RETRIES", "2")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ExecutionDeadlineMS != 3600000 {
+		t.Errorf("ExecutionDeadlineMS = %d, want 3600000", cfg.ExecutionDeadlineMS)
+	}
+	if cfg.DispatchReconcileMaxRetries != 5 {
+		t.Errorf("DispatchReconcileMaxRetries = %d, want 5", cfg.DispatchReconcileMaxRetries)
+	}
+	if cfg.ExecutorMaxRetries != 2 {
+		t.Errorf("ExecutorMaxRetries = %d, want 2", cfg.ExecutorMaxRetries)
+	}
+}
+
+func TestLoad_InvalidRecoveryConfig(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("EXECUTION_DEADLINE_MS", "not-a-number")
+
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("expected error for invalid EXECUTION_DEADLINE_MS, got nil")
+	}
 }
 
 func TestLoad_BaseBranchOverride(t *testing.T) {
