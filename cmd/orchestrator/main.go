@@ -114,6 +114,21 @@ func main() {
 			return orchestrator.DispatchRebase(ctx, c, pool, hs, dispatcher, task)
 		},
 		newHandle: uuid.New,
+		runFeatureLifecycle: func(ctx context.Context, pool *pgxpool.Pool, c *config.Config, wsID uuid.UUID) error {
+			return orchestrator.RunFeatureLifecycle(ctx, pool, c, ghClient, wsID)
+		},
+		pollHandoffPRs: func(ctx context.Context, pool *pgxpool.Pool) error {
+			return orchestrator.PollHandoffPRs(ctx, ghClient, pool)
+		},
+		findConflictedHandoffPRs: func(ctx context.Context, pool *pgxpool.Pool) ([]db.HandoffPr, error) {
+			return orchestrator.FindConflictedHandoffPRs(ctx, pool)
+		},
+		dispatchHandoffPRRebase: func(ctx context.Context, pool *pgxpool.Pool, c *config.Config, wsID uuid.UUID, pr db.HandoffPr, hs *orchestrator.HandleStore) (bool, error) {
+			return orchestrator.DispatchHandoffPRRebase(ctx, c, pool, hs, dispatcher, wsID, pr)
+		},
+		checkAndFinalizeHandoffs: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error {
+			return orchestrator.CheckAndFinalizeHandoffs(ctx, pool, ghClient, wsID)
+		},
 	}
 
 	ps := newPollState(cfg.PollIntervalSeconds)
@@ -182,6 +197,12 @@ type loopConfig struct {
 	findConflicted     func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
 	dispatchConflicted func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error)
 	newHandle          func() uuid.UUID
+	// Feature lifecycle + handoff (HIGH priority, run before task dispatch).
+	runFeatureLifecycle        func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID) error
+	pollHandoffPRs             func(ctx context.Context, pool *pgxpool.Pool) error
+	findConflictedHandoffPRs   func(ctx context.Context, pool *pgxpool.Pool) ([]db.HandoffPr, error)
+	dispatchHandoffPRRebase    func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, pr db.HandoffPr, hs *orchestrator.HandleStore) (bool, error)
+	checkAndFinalizeHandoffs   func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error
 }
 
 // runCycle executes one full poll iteration. Each step's errors are logged and
@@ -198,6 +219,54 @@ func runCycle(
 ) bool {
 	log.Debug().Msg("poll cycle start")
 	hadError := false
+
+	// Step 0a: feature lifecycle — in_implementation, handoff trigger (HIGH priority).
+	// Runs before task dispatch per the design cycle order.
+	if lc.runFeatureLifecycle != nil {
+		if err := lc.runFeatureLifecycle(ctx, pool, cfg, workspaceID); err != nil {
+			log.Error().Err(err).Msg("poll: RunFeatureLifecycle error")
+			hadError = true
+		}
+	}
+
+	// Step 0b: poll handoff PRs for merge/conflict status (HIGH priority).
+	if lc.pollHandoffPRs != nil {
+		if err := lc.pollHandoffPRs(ctx, pool); err != nil {
+			log.Error().Err(err).Msg("poll: PollHandoffPRs error")
+			hadError = true
+		}
+	}
+
+	// Step 0c: dispatch handoff-PR rebases for conflicted handoff PRs (HIGH priority).
+	if lc.findConflictedHandoffPRs != nil && lc.dispatchHandoffPRRebase != nil {
+		conflictedHPRs, err := lc.findConflictedHandoffPRs(ctx, pool)
+		if err != nil {
+			log.Error().Err(err).Msg("poll: FindConflictedHandoffPRs error")
+			hadError = true
+		} else {
+			for _, pr := range conflictedHPRs {
+				won, rebaseErr := lc.dispatchHandoffPRRebase(ctx, pool, cfg, workspaceID, pr, hs)
+				if rebaseErr != nil {
+					log.Error().Err(rebaseErr).Str("repo", pr.Repo).Msg("poll: DispatchHandoffPRRebase error")
+					hadError = true
+					continue
+				}
+				if !won {
+					log.Debug().Str("repo", pr.Repo).Msg("poll: handoff-PR rebase claim lost")
+					continue
+				}
+				log.Info().Str("repo", pr.Repo).Msg("poll: handoff-PR rebase dispatched")
+			}
+		}
+	}
+
+	// Step 0d: finalize handoffs where all handoff PRs are merged (HIGH priority).
+	if lc.checkAndFinalizeHandoffs != nil {
+		if err := lc.checkAndFinalizeHandoffs(ctx, pool, workspaceID); err != nil {
+			log.Error().Err(err).Msg("poll: CheckAndFinalizeHandoffs error")
+			hadError = true
+		}
+	}
 
 	// Step a: find eligible tasks and claim + dispatch each.
 	tasks, err := lc.findEligible(ctx, pool, workspaceID)

@@ -292,6 +292,18 @@ func (d *Dispatcher) EnqueueExisting(
 	})
 }
 
+// enqueueHandoffJob enqueues a pre-built dispatchJob to the Redis dispatch stream.
+// Used by DispatchHandoffPRRebase which constructs the job directly.
+func (d *Dispatcher) enqueueHandoffJob(ctx context.Context, job dispatchJob) error {
+	payload, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("enqueueHandoffJob: marshal: %w", err)
+	}
+	return d.stream.StreamAdd(ctx, "platform:dispatch", map[string]string{
+		"job": string(payload),
+	})
+}
+
 func (d *Dispatcher) getModelID(ctx context.Context, workspaceID string) string {
 	if d.db == nil {
 		return defaultImplementationModel
