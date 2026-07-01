@@ -691,3 +691,502 @@ func TestRunCycle_ConflictDispatch_Error(t *testing.T) {
 		t.Error("expected hadError=true when dispatchConflicted fails")
 	}
 }
+
+// --- Soft-claim throttle tests ---
+
+// TestRunCycle_Throttle_ZeroHeadroomBlocksAllDispatch verifies that when the
+// in-flight count equals MAX_INFLIGHT, no claim/reviewer/fix/rebase dispatch
+// occurs in that cycle.
+func TestRunCycle_Throttle_ZeroHeadroomBlocksAllDispatch(t *testing.T) {
+	cfg := &config.Config{
+		WorkspaceID:         uuid.New().String(),
+		BrokerURL:           "http://broker.test",
+		GitHubToken:         "tok",
+		ManagementRepo:      "owner/repo",
+		BaseBranch:          "main",
+		PollIntervalSeconds: 15,
+		MaxInFlight:         2, // already full
+	}
+	hs := orchestrator.NewHandleStore()
+	wsID := uuid.New()
+
+	claimCalled := false
+	reviewerCalled := false
+	fixCalled := false
+	conflictCalled := false
+	pollMergedPRsCalled := false
+
+	task := db.WorkspaceTask{TaskID: uuid.New(), FeatureID: uuid.New(), TaskName: "T1", FeatureName: "f"}
+
+	lc := loopConfig{
+		countInFlight: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) (int, error) {
+			return 2, nil // inflight == MAX_INFLIGHT → headroom = 0
+		},
+		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return []db.WorkspaceTask{task}, nil
+		},
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
+			claimCalled = true
+			return true, nil
+		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			return true, nil
+		},
+		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {
+			return nil
+		},
+		findReviewable: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return []db.WorkspaceTask{task}, nil
+		},
+		dispatchReviewer: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			reviewerCalled = true
+			return true, nil
+		},
+		findFixable: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return []db.WorkspaceTask{task}, nil
+		},
+		dispatchFix: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			fixCalled = true
+			return true, nil
+		},
+		findConflictedHandoffPRs: func(_ context.Context, _ *pgxpool.Pool, _ int) ([]db.HandoffPr, error) {
+			return nil, nil
+		},
+		findConflicted: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return []db.WorkspaceTask{task}, nil
+		},
+		dispatchConflicted: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			conflictCalled = true
+			return true, nil
+		},
+		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
+			return nil
+		},
+		pollMergedPRs: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) error {
+			pollMergedPRsCalled = true
+			return nil
+		},
+		newHandle: uuid.New,
+	}
+
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	if hadError {
+		t.Error("expected hadError=false — throttle skip is not an error")
+	}
+	if claimCalled {
+		t.Error("claim should not be called when headroom is 0")
+	}
+	if reviewerCalled {
+		t.Error("reviewer should not be called when headroom is 0")
+	}
+	if fixCalled {
+		t.Error("fix should not be called when headroom is 0")
+	}
+	if conflictCalled {
+		t.Error("task rebase should not be called when headroom is 0")
+	}
+	if !pollMergedPRsCalled {
+		t.Error("pollMergedPRs must run even when headroom is 0 — it guards the merged-is-truth invariant")
+	}
+}
+
+// TestRunCycle_Throttle_HeadroomLimitsDispatches verifies that exactly
+// MAX_INFLIGHT - inflight dispatches are made across all dispatch kinds.
+func TestRunCycle_Throttle_HeadroomLimitsDispatches(t *testing.T) {
+	cfg := &config.Config{
+		WorkspaceID:         uuid.New().String(),
+		BrokerURL:           "http://broker.test",
+		GitHubToken:         "tok",
+		ManagementRepo:      "owner/repo",
+		BaseBranch:          "main",
+		PollIntervalSeconds: 15,
+		MaxInFlight:         3, // inflight=1 → headroom=2
+	}
+	hs := orchestrator.NewHandleStore()
+	wsID := uuid.New()
+
+	dispatchCount := 0
+
+	mkTask := func(name string) db.WorkspaceTask {
+		return db.WorkspaceTask{TaskID: uuid.New(), FeatureID: uuid.New(), TaskName: name, FeatureName: "f"}
+	}
+	tasks := []db.WorkspaceTask{mkTask("T1"), mkTask("T2"), mkTask("T3"), mkTask("T4")}
+
+	lc := loopConfig{
+		countInFlight: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) (int, error) {
+			return 1, nil // headroom = 3 - 1 = 2
+		},
+		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return tasks, nil
+		},
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
+			return true, nil
+		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			return true, nil
+		},
+		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {
+			dispatchCount++
+			return nil
+		},
+		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
+			return nil
+		},
+		pollMergedPRs: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) error {
+			return nil
+		},
+		newHandle: uuid.New,
+	}
+
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	if hadError {
+		t.Error("expected hadError=false")
+	}
+	if dispatchCount != 2 {
+		t.Errorf("dispatched %d tasks, want 2 (headroom=2)", dispatchCount)
+	}
+}
+
+// TestRunCycle_Throttle_MultiInstanceOvershotBounded verifies that when inflight
+// already exceeds MAX_INFLIGHT (multi-instance race), headroom is 0 and no new
+// dispatches occur (overshoot is bounded, not compounded).
+func TestRunCycle_Throttle_MultiInstanceOvershotBounded(t *testing.T) {
+	cfg := &config.Config{
+		WorkspaceID:         uuid.New().String(),
+		BrokerURL:           "http://broker.test",
+		GitHubToken:         "tok",
+		ManagementRepo:      "owner/repo",
+		BaseBranch:          "main",
+		PollIntervalSeconds: 15,
+		MaxInFlight:         3,
+	}
+	hs := orchestrator.NewHandleStore()
+	wsID := uuid.New()
+
+	claimCalled := false
+	task := db.WorkspaceTask{TaskID: uuid.New(), FeatureID: uuid.New(), TaskName: "T1", FeatureName: "f"}
+
+	lc := loopConfig{
+		countInFlight: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) (int, error) {
+			return 5, nil // inflight > MAX_INFLIGHT — overshoot scenario
+		},
+		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return []db.WorkspaceTask{task}, nil
+		},
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
+			claimCalled = true
+			return true, nil
+		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			return true, nil
+		},
+		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {
+			return nil
+		},
+		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
+			return nil
+		},
+		pollMergedPRs: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) error {
+			return nil
+		},
+		newHandle: uuid.New,
+	}
+
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	if hadError {
+		t.Error("expected hadError=false — overshoot detected but not an error")
+	}
+	if claimCalled {
+		t.Error("claim should not be called when inflight > MAX_INFLIGHT")
+	}
+}
+
+// TestRunCycle_Throttle_CountInFlightError verifies that a CountInFlight error
+// skips all dispatch kinds (safe-fail) and returns hadError=true. Reap and
+// reconcile still run.
+func TestRunCycle_Throttle_CountInFlightError(t *testing.T) {
+	cfg := &config.Config{
+		WorkspaceID:         uuid.New().String(),
+		BrokerURL:           "http://broker.test",
+		GitHubToken:         "tok",
+		ManagementRepo:      "owner/repo",
+		BaseBranch:          "main",
+		PollIntervalSeconds: 15,
+		MaxInFlight:         5,
+	}
+	hs := orchestrator.NewHandleStore()
+	wsID := uuid.New()
+
+	claimCalled := false
+	reapCalled := false
+	reconcileCalled := false
+	pollMergedPRsCalled := false
+
+	task := db.WorkspaceTask{TaskID: uuid.New(), FeatureID: uuid.New(), TaskName: "T1", FeatureName: "f"}
+
+	lc := loopConfig{
+		countInFlight: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) (int, error) {
+			return 0, errors.New("db unavailable")
+		},
+		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return []db.WorkspaceTask{task}, nil
+		},
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
+			claimCalled = true
+			return true, nil
+		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			return true, nil
+		},
+		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {
+			return nil
+		},
+		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
+			reapCalled = true
+			return nil
+		},
+		reconcileStuck: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool) error {
+			reconcileCalled = true
+			return nil
+		},
+		pollMergedPRs: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) error {
+			pollMergedPRsCalled = true
+			return nil
+		},
+		newHandle: uuid.New,
+	}
+
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	if !hadError {
+		t.Error("expected hadError=true when CountInFlight fails")
+	}
+	if claimCalled {
+		t.Error("claim should not be called when CountInFlight returns an error")
+	}
+	if !reapCalled {
+		t.Error("reap should still run even when CountInFlight fails")
+	}
+	if !reconcileCalled {
+		t.Error("reconcile should still run even when CountInFlight fails")
+	}
+	if !pollMergedPRsCalled {
+		t.Error("pollMergedPRs must run even when CountInFlight fails — it guards the merged-is-truth invariant")
+	}
+}
+
+// TestRunCycle_CycleOrder_HandoffRebaseBeforeTaskDispatch verifies that
+// handoff-PR rebases (HIGH priority) run before task claim dispatch.
+func TestRunCycle_CycleOrder_HandoffRebaseBeforeTaskDispatch(t *testing.T) {
+	cfg := &config.Config{
+		WorkspaceID:         uuid.New().String(),
+		BrokerURL:           "http://broker.test",
+		GitHubToken:         "tok",
+		ManagementRepo:      "owner/repo",
+		BaseBranch:          "main",
+		PollIntervalSeconds: 15,
+		MaxInFlight:         5,
+	}
+	hs := orchestrator.NewHandleStore()
+	wsID := uuid.New()
+
+	var order []string
+
+	task := db.WorkspaceTask{TaskID: uuid.New(), FeatureID: uuid.New(), TaskName: "T1", FeatureName: "f"}
+	hpr := db.HandoffPr{ID: uuid.New(), Repo: "workflow-backend"}
+
+	lc := loopConfig{
+		countInFlight: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) (int, error) {
+			return 0, nil
+		},
+		findConflictedHandoffPRs: func(_ context.Context, _ *pgxpool.Pool, _ int) ([]db.HandoffPr, error) {
+			return []db.HandoffPr{hpr}, nil
+		},
+		dispatchHandoffPRRebase: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.HandoffPr, _ *orchestrator.HandleStore) (bool, error) {
+			order = append(order, "handoff-rebase")
+			return true, nil
+		},
+		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return []db.WorkspaceTask{task}, nil
+		},
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
+			order = append(order, "task-claim")
+			return true, nil
+		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			return true, nil
+		},
+		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {
+			return nil
+		},
+		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
+			order = append(order, "reap")
+			return nil
+		},
+		pollMergedPRs: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) error {
+			order = append(order, "poll-merged-prs")
+			return nil
+		},
+		newHandle: uuid.New,
+	}
+
+	runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+
+	// Expected order: handoff-rebase → task-claim → poll-merged-prs → reap
+	if len(order) < 4 {
+		t.Fatalf("expected at least 4 steps recorded, got %d: %v", len(order), order)
+	}
+	handoffIdx, claimIdx, pollIdx, reapIdx := -1, -1, -1, -1
+	for i, s := range order {
+		switch s {
+		case "handoff-rebase":
+			handoffIdx = i
+		case "task-claim":
+			claimIdx = i
+		case "poll-merged-prs":
+			pollIdx = i
+		case "reap":
+			reapIdx = i
+		}
+	}
+	if handoffIdx == -1 || claimIdx == -1 || pollIdx == -1 || reapIdx == -1 {
+		t.Fatalf("missing step in order: %v", order)
+	}
+	if handoffIdx >= claimIdx {
+		t.Errorf("handoff-rebase (%d) must run before task-claim (%d), order: %v", handoffIdx, claimIdx, order)
+	}
+	if claimIdx >= pollIdx {
+		t.Errorf("task-claim (%d) must run before poll-merged-prs (%d), order: %v", claimIdx, pollIdx, order)
+	}
+	if pollIdx >= reapIdx {
+		t.Errorf("poll-merged-prs (%d) must run before reap (%d), order: %v", pollIdx, reapIdx, order)
+	}
+}
+
+// TestRunCycle_CycleOrder_TaskRebaseBeforeReap verifies that task-rebase dispatch
+// runs after poll-merged-PRs but before reap, so newly-conflicted tasks are
+// picked up within the same cycle.
+func TestRunCycle_CycleOrder_TaskRebaseBeforeReap(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.MaxInFlight = 5
+	hs := orchestrator.NewHandleStore()
+	wsID := uuid.New()
+
+	var order []string
+
+	task := db.WorkspaceTask{TaskID: uuid.New(), FeatureID: uuid.New(), TaskName: "T1", FeatureName: "f"}
+
+	lc := loopConfig{
+		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
+			return false, nil
+		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			return true, nil
+		},
+		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {
+			return nil
+		},
+		findConflicted: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return []db.WorkspaceTask{task}, nil
+		},
+		dispatchConflicted: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			order = append(order, "task-rebase")
+			return true, nil
+		},
+		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
+			order = append(order, "reap")
+			return nil
+		},
+		pollMergedPRs: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) error {
+			order = append(order, "poll-merged-prs")
+			return nil
+		},
+		newHandle: uuid.New,
+	}
+
+	runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+
+	rebaseIdx, pollIdx, reapIdx := -1, -1, -1
+	for i, s := range order {
+		switch s {
+		case "task-rebase":
+			rebaseIdx = i
+		case "poll-merged-prs":
+			pollIdx = i
+		case "reap":
+			reapIdx = i
+		}
+	}
+	if rebaseIdx == -1 || pollIdx == -1 || reapIdx == -1 {
+		t.Fatalf("missing step in order: %v", order)
+	}
+	if pollIdx >= rebaseIdx {
+		t.Errorf("poll-merged-prs (%d) must run before task-rebase (%d), order: %v", pollIdx, rebaseIdx, order)
+	}
+	if rebaseIdx >= reapIdx {
+		t.Errorf("task-rebase (%d) must run before reap (%d), order: %v", rebaseIdx, reapIdx, order)
+	}
+}
+
+// TestRunCycle_Throttle_HandoffRebaseConsumesBudget verifies that handoff-PR
+// rebases consume the shared headroom before task dispatch.
+func TestRunCycle_Throttle_HandoffRebaseConsumesBudget(t *testing.T) {
+	cfg := &config.Config{
+		WorkspaceID:         uuid.New().String(),
+		BrokerURL:           "http://broker.test",
+		GitHubToken:         "tok",
+		ManagementRepo:      "owner/repo",
+		BaseBranch:          "main",
+		PollIntervalSeconds: 15,
+		MaxInFlight:         2,
+	}
+	hs := orchestrator.NewHandleStore()
+	wsID := uuid.New()
+
+	taskClaimCalled := false
+	task := db.WorkspaceTask{TaskID: uuid.New(), FeatureID: uuid.New(), TaskName: "T1", FeatureName: "f"}
+	hpr1 := db.HandoffPr{ID: uuid.New(), Repo: "repo-a"}
+	hpr2 := db.HandoffPr{ID: uuid.New(), Repo: "repo-b"}
+
+	lc := loopConfig{
+		countInFlight: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) (int, error) {
+			return 0, nil // headroom = 2
+		},
+		findConflictedHandoffPRs: func(_ context.Context, _ *pgxpool.Pool, _ int) ([]db.HandoffPr, error) {
+			return []db.HandoffPr{hpr1, hpr2}, nil // 2 handoff rebases exhaust headroom
+		},
+		dispatchHandoffPRRebase: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.HandoffPr, _ *orchestrator.HandleStore) (bool, error) {
+			return true, nil
+		},
+		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return []db.WorkspaceTask{task}, nil
+		},
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
+			taskClaimCalled = true
+			return true, nil
+		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			return true, nil
+		},
+		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {
+			return nil
+		},
+		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
+			return nil
+		},
+		pollMergedPRs: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) error {
+			return nil
+		},
+		newHandle: uuid.New,
+	}
+
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	if hadError {
+		t.Error("expected hadError=false")
+	}
+	if taskClaimCalled {
+		t.Error("task claim should not be called — headroom exhausted by handoff rebases")
+	}
+}

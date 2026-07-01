@@ -325,12 +325,12 @@ func DispatchHandoffPRRebase(
 		Handle:             handle,
 		Nonce:              nonce,
 		Kind:               "handoff_rebase",
-		TaskID:             pr.Repo,           // repo name as task slug for broker metadata
-		FeatureID:          info.featureName,  // feature name as feature slug
+		TaskID:             pr.Repo,          // repo name as task slug for broker metadata
+		FeatureID:          info.featureName, // feature name as feature slug
 		WorkspaceID:        cfg.WorkspaceID,
 		TaskRepoURL:        info.repoURL,
-		TaskRepoBranch:     featureBranch,     // the feature branch being rebased
-		TaskBaseBranch:     info.baseBranch,   // base (main) to rebase onto
+		TaskRepoBranch:     featureBranch,   // the feature branch being rebased
+		TaskBaseBranch:     info.baseBranch, // base (main) to rebase onto
 		TaskRepoBaseBranch: info.baseBranch,
 		MgmtRepoURL:        cfg.ManagementRepo,
 		CallbackURL:        cfg.BrokerURL + "/callback",

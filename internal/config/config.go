@@ -27,6 +27,9 @@ type Config struct {
 
 	// Conflict resolution
 	MaxRebaseAttempts int // rebase retry cap before block (Path A) / stay-conflicted (Path B); default 3
+
+	// Soft-claim throttle
+	MaxInFlight int // maximum concurrent dispatched tasks across all dispatch kinds; default 5
 }
 
 // Load reads configuration from environment variables. Returns an error if any
@@ -105,6 +108,16 @@ func Load() (*Config, error) {
 			errs = append(errs, fmt.Errorf("MAX_REBASE_ATTEMPTS must be an integer: %w", err))
 		} else {
 			cfg.MaxRebaseAttempts = n
+		}
+	}
+
+	cfg.MaxInFlight = 5
+	if raw := os.Getenv("MAX_INFLIGHT"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("MAX_INFLIGHT must be an integer: %w", err))
+		} else {
+			cfg.MaxInFlight = n
 		}
 	}
 
