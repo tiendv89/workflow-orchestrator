@@ -59,7 +59,6 @@ type fakeTransition struct {
 	slowLookupResult *HandleEntry
 	slowLookupErr    error
 	maxTurnsCount    int32 // returned by getMaxTurnsCount
-	noVerdictReturns bool  // controls HandleNoVerdict return (default true)
 }
 
 func (f *fakeTransition) setInReview(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, prURL string) (bool, error) {
