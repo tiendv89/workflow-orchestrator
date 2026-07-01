@@ -50,6 +50,8 @@ type Reaper struct {
 	handleRebaseResult func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, success bool, maxAttempts int) error
 	slowLookup         func(ctx context.Context, pool *pgxpool.Pool, workspaceID uuid.UUID, featureName, taskName string) (*HandleEntry, error)
 	appendLog          func(ctx context.Context, pool *pgxpool.Pool, workspaceID, featureUUID, taskUUID uuid.UUID, action, by, note string) error
+	// handleHandoffRebase routes a handoff-PR rebase completion.
+	handleHandoffRebase func(ctx context.Context, pool *pgxpool.Pool, handoffPRID uuid.UUID, success bool, maxAttempts int) error
 }
 
 func newReaper(brokerURL string, httpClient *http.Client, maxReviewIncompls, executorMaxRetries, maxRebaseAttempts int) *Reaper {
@@ -86,6 +88,9 @@ func newReaper(brokerURL string, httpClient *http.Client, maxReviewIncompls, exe
 		appendLog:          AppendLog,
 		executorMaxRetries: executorMaxRetries,
 		maxRebaseAttempts:  maxRebaseAttempts,
+		handleHandoffRebase: func(ctx context.Context, pool *pgxpool.Pool, handoffPRID uuid.UUID, success bool, maxAttempts int) error {
+			return HandleHandoffPRRebaseCompletion(ctx, pool, handoffPRID, success, maxAttempts)
+		},
 	}
 }
 
@@ -237,6 +242,11 @@ func (r *Reaper) processOne(
 		entry = *resolved
 	}
 
+	// Handoff-PR rebase completions are routed separately.
+	if c.Metadata.Kind == "handoff_rebase" && entry.HandoffPRID != nil {
+		return r.processHandoffRebaseCompletion(ctx, pool, hs, c, entry)
+	}
+
 	isReviewKind := c.Metadata.Kind == "review"
 
 	switch c.Result.TerminalStatus {
@@ -326,6 +336,27 @@ func (r *Reaper) processOne(
 		log.Warn().Err(err).Str("handle", c.Handle).Msg("reap: failed to append log entry")
 	}
 
+	return nil
+}
+
+// processHandoffRebaseCompletion routes a completion record for a handoff-PR
+// rebase job. success/failure is derived from the terminal_status.
+func (r *Reaper) processHandoffRebaseCompletion(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	hs *HandleStore,
+	c completionRecord,
+	entry HandleEntry,
+) error {
+	prID := *entry.HandoffPRID
+	success := c.Result.TerminalStatus == "rebase_success"
+
+	if r.handleHandoffRebase != nil {
+		if err := r.handleHandoffRebase(ctx, pool, prID, success, r.maxRebaseAttempts); err != nil {
+			return fmt.Errorf("processHandoffRebaseCompletion handle=%q: %w", c.Handle, err)
+		}
+	}
+	hs.Delete(c.Handle)
 	return nil
 }
 
