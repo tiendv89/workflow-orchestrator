@@ -31,6 +31,7 @@ type fakeTransition struct {
 		workspaceID uuid.UUID
 		taskUUID    uuid.UUID
 		reason      string
+		fromStatus  string
 	}
 	logCalls []struct {
 		action string
@@ -51,14 +52,15 @@ func (f *fakeTransition) setInReview(_ context.Context, _ *pgxpool.Pool, workspa
 	return true, nil
 }
 
-func (f *fakeTransition) setBlocked(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, reason string) (bool, error) {
+func (f *fakeTransition) setBlocked(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, reason, fromStatus string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.blockedCalls = append(f.blockedCalls, struct {
 		workspaceID uuid.UUID
 		taskUUID    uuid.UUID
 		reason      string
-	}{workspaceID, taskUUID, reason})
+		fromStatus  string
+	}{workspaceID, taskUUID, reason, fromStatus})
 	return true, nil
 }
 
@@ -184,9 +186,9 @@ func TestReap_GoCompletion_InReview(t *testing.T) {
 	}
 }
 
-// TestReap_GoCompletion_Blocked verifies that a go completion with
-// terminal_status "blocked" calls SetBlocked with the correct reason.
-func TestReap_GoCompletion_Blocked(t *testing.T) {
+// TestReap_GoCompletion_Blocked_ImplKind verifies that a go completion with
+// terminal_status "blocked" from an impl dispatch records blocked_from_status="in_progress".
+func TestReap_GoCompletion_Blocked_ImplKind(t *testing.T) {
 	taskUUID := uuid.New()
 	featureUUID := uuid.New()
 	workspaceUUID := uuid.New()
@@ -194,6 +196,7 @@ func TestReap_GoCompletion_Blocked(t *testing.T) {
 	completion := completionRecord{
 		Handle: "handle-002",
 		Metadata: handleMetadata{
+			Kind:      "impl",
 			FeatureID: "feat",
 			TaskID:    "T2",
 		},
@@ -231,15 +234,129 @@ func TestReap_GoCompletion_Blocked(t *testing.T) {
 	if len(ft.blockedCalls) != 1 {
 		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
 	}
-	if ft.blockedCalls[0].taskUUID != taskUUID {
-		t.Errorf("taskUUID = %v, want %v", ft.blockedCalls[0].taskUUID, taskUUID)
+	call := ft.blockedCalls[0]
+	if call.taskUUID != taskUUID {
+		t.Errorf("taskUUID = %v, want %v", call.taskUUID, taskUUID)
 	}
-	if ft.blockedCalls[0].reason != "tests_failed" {
-		t.Errorf("reason = %q, want tests_failed", ft.blockedCalls[0].reason)
+	if call.reason != "tests_failed" {
+		t.Errorf("reason = %q, want tests_failed", call.reason)
+	}
+	if call.fromStatus != "in_progress" {
+		t.Errorf("fromStatus = %q, want in_progress for impl dispatch kind", call.fromStatus)
 	}
 
 	if _, found := hs.Lookup("handle-002"); found {
 		t.Error("handle-002 still in store after reap; want deleted")
+	}
+}
+
+// TestReap_GoCompletion_Blocked_ReviewKind verifies that a go completion with
+// terminal_status "blocked" from a review dispatch records blocked_from_status="reviewing".
+func TestReap_GoCompletion_Blocked_ReviewKind(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-review-blocked",
+		Metadata: handleMetadata{
+			Kind:      "review",
+			FeatureID: "feat",
+			TaskID:    "T3",
+		},
+		Result: executorResult{
+			TerminalStatus: "blocked",
+			BlockedReason:  "missing_tool",
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("handle-review-blocked", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "feat",
+		TaskName:    "T3",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	if len(ft.blockedCalls) != 1 {
+		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
+	}
+	call := ft.blockedCalls[0]
+	if call.fromStatus != "reviewing" {
+		t.Errorf("fromStatus = %q, want reviewing for review dispatch kind", call.fromStatus)
+	}
+	if call.reason != "missing_tool" {
+		t.Errorf("reason = %q, want missing_tool", call.reason)
+	}
+}
+
+// TestReap_GoCompletion_Blocked_FixKind verifies that a fix dispatch blocked
+// completion records blocked_from_status="in_progress".
+func TestReap_GoCompletion_Blocked_FixKind(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-fix-blocked",
+		Metadata: handleMetadata{
+			Kind:      "fix",
+			FeatureID: "feat",
+			TaskID:    "T4",
+		},
+		Result: executorResult{
+			TerminalStatus: "blocked",
+			BlockedReason:  "handover_for_continuation",
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("handle-fix-blocked", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "feat",
+		TaskName:    "T4",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	if len(ft.blockedCalls) != 1 {
+		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
+	}
+	if ft.blockedCalls[0].fromStatus != "in_progress" {
+		t.Errorf("fromStatus = %q, want in_progress for fix dispatch kind", ft.blockedCalls[0].fromStatus)
 	}
 }
 
