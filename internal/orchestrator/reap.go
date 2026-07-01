@@ -244,7 +244,7 @@ func (r *Reaper) processOne(
 
 	// Handoff-PR rebase completions are routed separately.
 	if c.Metadata.Kind == "handoff_rebase" && entry.HandoffPRID != nil {
-		return r.processHandoffRebaseCompletion(ctx, pool, c, entry)
+		return r.processHandoffRebaseCompletion(ctx, pool, hs, c, entry)
 	}
 
 	isReviewKind := c.Metadata.Kind == "review"
@@ -344,6 +344,7 @@ func (r *Reaper) processOne(
 func (r *Reaper) processHandoffRebaseCompletion(
 	ctx context.Context,
 	pool *pgxpool.Pool,
+	hs *HandleStore,
 	c completionRecord,
 	entry HandleEntry,
 ) error {
@@ -355,6 +356,7 @@ func (r *Reaper) processHandoffRebaseCompletion(
 			return fmt.Errorf("processHandoffRebaseCompletion handle=%q: %w", c.Handle, err)
 		}
 	}
+	hs.Delete(c.Handle)
 	return nil
 }
 

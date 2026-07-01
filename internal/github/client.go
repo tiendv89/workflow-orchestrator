@@ -196,10 +196,13 @@ func (c *Client) MergePR(ctx context.Context, prURL string) error {
 		}
 	}()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusNoContent, http.StatusMethodNotAllowed:
+		// 405 = already merged or branch protection — idempotent, treat as success.
+		return nil
+	default:
 		return fmt.Errorf("MergePR: unexpected status %d for %s", resp.StatusCode, prURL)
 	}
-	return nil
 }
 
 // BranchExists checks whether branch exists in the repo at repoURL.
