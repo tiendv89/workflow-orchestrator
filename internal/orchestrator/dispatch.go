@@ -116,24 +116,26 @@ func (d *Dispatcher) Dispatch(ctx context.Context, cfg *config.Config, task db.W
 }
 
 // DispatchWithNonce registers the handle with the broker and enqueues a
-// DispatchJob using an externally-provided nonce and kind. Use this when the
-// nonce must be persisted to the DB before dispatch (e.g. reviewer/fix claims
-// where SetReviewing/ClaimFix atomically stores handle+nonce).
+// DispatchJob using an externally-provided nonce and kind (e.g. "impl", "review",
+// "rebase"). Use this when the nonce must be persisted to the DB before dispatch
+// (e.g. reviewer/fix/rebase claims where SetReviewing/ClaimFix/SetResolving
+// atomically store handle+nonce) — the executor's /callback validates the nonce
+// it receives against the one persisted in the DB, so they must match exactly.
 func (d *Dispatcher) DispatchWithNonce(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle, nonce, kind string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	if err := d.registerHandle(ctx, handle, task, cfg.OrganizationID, nonce, now, kind); err != nil {
+	if err := d.registerHandleWithKind(ctx, handle, task, cfg.OrganizationID, nonce, now, kind); err != nil {
 		return fmt.Errorf("dispatch(%s): broker register: %w", kind, err)
 	}
 
-	if err := d.enqueueJob(ctx, cfg, task, handle, nonce, now, kind); err != nil {
+	if err := d.enqueueJobWithKind(ctx, cfg, task, handle, nonce, now, kind); err != nil {
 		return fmt.Errorf("dispatch(%s): enqueue job: %w", kind, err)
 	}
 
 	return nil
 }
 
-func (d *Dispatcher) registerHandle(
+func (d *Dispatcher) registerHandleWithKind(
 	ctx context.Context,
 	handle string,
 	task db.WorkspaceTask,
@@ -184,7 +186,7 @@ func (d *Dispatcher) registerHandle(
 	return nil
 }
 
-func (d *Dispatcher) enqueueJob(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle, nonce, now, kind string) error {
+func (d *Dispatcher) enqueueJobWithKind(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle, nonce, now, kind string) error {
 	branch := ResolveTaskBranch(task)
 	repoURL, err := d.getRepoURL(ctx, cfg, task)
 	if err != nil {

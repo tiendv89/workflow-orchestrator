@@ -24,6 +24,9 @@ type Config struct {
 	ExecutionDeadlineMS         int // max ms a task can be in_progress/reviewing; default 7200000 (2h)
 	DispatchReconcileMaxRetries int // reconciler re-enqueue cap before block; default 3
 	ExecutorMaxRetries          int // max-turns reset cap before block; default 3
+
+	// Conflict resolution
+	MaxRebaseAttempts int // rebase retry cap before block (Path A) / stay-conflicted (Path B); default 3
 }
 
 // Load reads configuration from environment variables. Returns an error if any
@@ -92,6 +95,16 @@ func Load() (*Config, error) {
 			errs = append(errs, fmt.Errorf("EXECUTOR_MAX_RETRIES must be an integer: %w", err))
 		} else {
 			cfg.ExecutorMaxRetries = n
+		}
+	}
+
+	cfg.MaxRebaseAttempts = 3
+	if raw := os.Getenv("MAX_REBASE_ATTEMPTS"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("MAX_REBASE_ATTEMPTS must be an integer: %w", err))
+		} else {
+			cfg.MaxRebaseAttempts = n
 		}
 	}
 
