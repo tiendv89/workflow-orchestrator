@@ -53,9 +53,9 @@ func cleanupHandoffs(t *testing.T, ctx context.Context, pool *pgxpool.Pool, fx t
 }
 
 // minimalCfg returns a config that skips all GitHub calls:
-// - empty ManagementRepo → createMgmtHandoffPR is a no-op
-// - tasks with no matching workspace_repos row hit ErrNoRows in createHandoffPR
-//   and are recorded as skipped_no_branch rather than an error.
+//   - empty ManagementRepo → createMgmtHandoffPR is a no-op
+//   - tasks with no matching workspace_repos row hit ErrNoRows in createHandoffPR
+//     and are recorded as skipped_no_branch rather than an error.
 func minimalCfg(workspaceID uuid.UUID) *config.Config {
 	return &config.Config{
 		WorkspaceID:    workspaceID.String(),

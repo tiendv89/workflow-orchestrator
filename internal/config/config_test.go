@@ -69,6 +69,10 @@ func TestLoad_AllPresent(t *testing.T) {
 	if cfg.MaxRebaseAttempts != 3 {
 		t.Errorf("MaxRebaseAttempts default = %d, want 3", cfg.MaxRebaseAttempts)
 	}
+	// soft-claim throttle defaults
+	if cfg.MaxInFlight != 5 {
+		t.Errorf("MaxInFlight default = %d, want 5", cfg.MaxInFlight)
+	}
 }
 
 func TestLoad_RecoveryConfigOverrides(t *testing.T) {
@@ -196,5 +200,40 @@ func TestLoad_InvalidMaxRebaseAttempts(t *testing.T) {
 	_, err := config.Load()
 	if err == nil {
 		t.Fatal("expected error for invalid MAX_REBASE_ATTEMPTS, got nil")
+	}
+}
+
+func TestLoad_MaxInFlightDefault(t *testing.T) {
+	setAllRequired(t)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxInFlight != 5 {
+		t.Errorf("MaxInFlight default = %d, want 5", cfg.MaxInFlight)
+	}
+}
+
+func TestLoad_MaxInFlightOverride(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MAX_INFLIGHT", "10")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxInFlight != 10 {
+		t.Errorf("MaxInFlight = %d, want 10", cfg.MaxInFlight)
+	}
+}
+
+func TestLoad_InvalidMaxInFlight(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MAX_INFLIGHT", "not-a-number")
+
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("expected error for invalid MAX_INFLIGHT, got nil")
 	}
 }
