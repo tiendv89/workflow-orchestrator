@@ -330,7 +330,10 @@ func TestReap_GoCompletion_Blocked_ImplKind(t *testing.T) {
 }
 
 // TestReap_GoCompletion_Blocked_ReviewKind verifies that a go completion with
-// terminal_status "blocked" from a review dispatch records blocked_from_status="reviewing".
+// terminal_status "blocked" from a review dispatch is treated as a no-valid-verdict
+// outcome (HandleNoVerdict), per technical-design.md's FSM: reviewing's only blocked
+// transition is "no valid verdict (>= MAX)" via review_incomplete — an agent-reported
+// block from a reviewer is not distinguished from any other missing verdict.
 func TestReap_GoCompletion_Blocked_ReviewKind(t *testing.T) {
 	taskUUID := uuid.New()
 	featureUUID := uuid.New()
@@ -374,15 +377,18 @@ func TestReap_GoCompletion_Blocked_ReviewKind(t *testing.T) {
 
 	ft.mu.Lock()
 	defer ft.mu.Unlock()
-	if len(ft.blockedCalls) != 1 {
-		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
+	if len(ft.blockedCalls) != 0 {
+		t.Errorf("SetBlocked called %d times, want 0 — review-kind blocked routes through HandleNoVerdict", len(ft.blockedCalls))
 	}
-	call := ft.blockedCalls[0]
-	if call.fromStatus != "reviewing" {
-		t.Errorf("fromStatus = %q, want reviewing for review dispatch kind", call.fromStatus)
+	if len(ft.noVerdictCalls) != 1 {
+		t.Fatalf("HandleNoVerdict called %d times, want 1", len(ft.noVerdictCalls))
 	}
-	if call.reason != "missing_tool" {
-		t.Errorf("reason = %q, want missing_tool", call.reason)
+	call := ft.noVerdictCalls[0]
+	if call.taskUUID != taskUUID {
+		t.Errorf("taskUUID = %v, want %v", call.taskUUID, taskUUID)
+	}
+	if call.max != MaxReviewIncompletes {
+		t.Errorf("max = %d, want %d", call.max, MaxReviewIncompletes)
 	}
 }
 

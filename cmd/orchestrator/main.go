@@ -236,50 +236,57 @@ func runCycle(
 	}
 
 	// Step b: find reviewable tasks and dispatch a reviewer for each.
-	reviewable, err := lc.findReviewable(ctx, pool, workspaceID)
-	if err != nil {
-		log.Error().Err(err).Msg("poll: FindReviewableTasks")
-		hadError = true
-	} else {
-		for _, task := range reviewable {
-			won, reviewErr := lc.dispatchReviewer(ctx, pool, cfg, workspaceID, task, hs)
-			if reviewErr != nil {
-				log.Error().Err(reviewErr).Str("task", task.TaskName).Msg("poll: DispatchReviewer error")
-				hadError = true
-				continue
+	// findReviewable/dispatchReviewer and findFixable/dispatchFix are nil-guarded
+	// like reconcileStuck below — existing callers that don't wire the reviewer
+	// cluster still work.
+	if lc.findReviewable != nil && lc.dispatchReviewer != nil {
+		reviewable, err := lc.findReviewable(ctx, pool, workspaceID)
+		if err != nil {
+			log.Error().Err(err).Msg("poll: FindReviewableTasks")
+			hadError = true
+		} else {
+			for _, task := range reviewable {
+				won, reviewErr := lc.dispatchReviewer(ctx, pool, cfg, workspaceID, task, hs)
+				if reviewErr != nil {
+					log.Error().Err(reviewErr).Str("task", task.TaskName).Msg("poll: DispatchReviewer error")
+					hadError = true
+					continue
+				}
+				if !won {
+					log.Debug().Str("task", task.TaskName).Msg("poll: reviewer claim lost — another instance won")
+					continue
+				}
+				log.Info().
+					Str("task", task.TaskName).
+					Str("feature", task.FeatureName).
+					Msg("poll: reviewer dispatched")
 			}
-			if !won {
-				log.Debug().Str("task", task.TaskName).Msg("poll: reviewer claim lost — another instance won")
-				continue
-			}
-			log.Info().
-				Str("task", task.TaskName).
-				Str("feature", task.FeatureName).
-				Msg("poll: reviewer dispatched")
 		}
 	}
 
 	// Step c: find change_requested tasks and dispatch a fix agent for each.
-	fixable, err := lc.findFixable(ctx, pool, workspaceID)
-	if err != nil {
-		log.Error().Err(err).Msg("poll: FindFixableTasks")
-		hadError = true
-	} else {
-		for _, task := range fixable {
-			won, fixErr := lc.dispatchFix(ctx, pool, cfg, workspaceID, task, hs)
-			if fixErr != nil {
-				log.Error().Err(fixErr).Str("task", task.TaskName).Msg("poll: DispatchFix error")
-				hadError = true
-				continue
+	if lc.findFixable != nil && lc.dispatchFix != nil {
+		fixable, err := lc.findFixable(ctx, pool, workspaceID)
+		if err != nil {
+			log.Error().Err(err).Msg("poll: FindFixableTasks")
+			hadError = true
+		} else {
+			for _, task := range fixable {
+				won, fixErr := lc.dispatchFix(ctx, pool, cfg, workspaceID, task, hs)
+				if fixErr != nil {
+					log.Error().Err(fixErr).Str("task", task.TaskName).Msg("poll: DispatchFix error")
+					hadError = true
+					continue
+				}
+				if !won {
+					log.Debug().Str("task", task.TaskName).Msg("poll: fix claim lost — another instance won")
+					continue
+				}
+				log.Info().
+					Str("task", task.TaskName).
+					Str("feature", task.FeatureName).
+					Msg("poll: fix agent dispatched")
 			}
-			if !won {
-				log.Debug().Str("task", task.TaskName).Msg("poll: fix claim lost — another instance won")
-				continue
-			}
-			log.Info().
-				Str("task", task.TaskName).
-				Str("feature", task.FeatureName).
-				Msg("poll: fix agent dispatched")
 		}
 	}
 

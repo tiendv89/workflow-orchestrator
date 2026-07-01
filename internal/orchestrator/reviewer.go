@@ -16,20 +16,8 @@ import (
 // outcomes before a task is escalated from review_incomplete to blocked.
 const MaxReviewIncompletes = 2
 
-// FindReviewableTasks returns go-owned tasks in in_review or review_incomplete
-// status that have a PR URL set and are eligible for reviewer dispatch.
-func FindReviewableTasks(ctx context.Context, pool *pgxpool.Pool, workspaceID uuid.UUID) ([]db.WorkspaceTask, error) {
-	q := db.New(pool)
-	owner := "go"
-	tasks, err := q.ListReviewableTasksForOwner(ctx, db.ListReviewableTasksForOwnerParams{
-		WorkspaceID: workspaceID,
-		Owner:       &owner,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("FindReviewableTasks: %w", err)
-	}
-	return tasks, nil
-}
+// FindReviewableTasks is defined in eligibility.go (added by T9, which needed
+// it for the unblock-resume path before this task merged).
 
 // DispatchReviewer claims a reviewable task (in_review or review_incomplete)
 // for a reviewer agent (guarded in_review→reviewing or
