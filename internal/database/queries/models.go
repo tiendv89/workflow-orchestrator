@@ -9,6 +9,31 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type Handoff struct {
+	ID          uuid.UUID          `json:"id"`
+	WorkspaceID uuid.UUID          `json:"workspace_id"`
+	FeatureID   uuid.UUID          `json:"feature_id"`
+	MgmtPrURL   *string            `json:"mgmt_pr_url"`
+	Status      string             `json:"status"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	FinalizedAt pgtype.Timestamptz `json:"finalized_at"`
+}
+
+type HandoffPr struct {
+	ID                uuid.UUID          `json:"id"`
+	HandoffID         uuid.UUID          `json:"handoff_id"`
+	Repo              string             `json:"repo"`
+	PrURL             *string            `json:"pr_url"`
+	Status            string             `json:"status"`
+	ConflictState     string             `json:"conflict_state"`
+	RebaseAttempts    int32              `json:"rebase_attempts"`
+	DispatchHandle    *string            `json:"dispatch_handle"`
+	DispatchNonce     *string            `json:"dispatch_nonce"`
+	DispatchedAt      pgtype.Timestamptz `json:"dispatched_at"`
+	ReenqueueAttempts int32              `json:"reenqueue_attempts"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
 type Workspace struct {
 	ID               uuid.UUID          `json:"id"`
 	OrganizationID   uuid.UUID          `json:"organization_id"`
@@ -66,24 +91,35 @@ type WorkspaceRepo struct {
 }
 
 type WorkspaceTask struct {
-	ID            uuid.UUID          `json:"id"`
-	WorkspaceID   uuid.UUID          `json:"workspace_id"`
-	FeatureID     uuid.UUID          `json:"feature_id"`
-	FeatureName   string             `json:"feature_name"`
-	TaskID        uuid.UUID          `json:"task_id"`
-	TaskName      string             `json:"task_name"`
-	Title         string             `json:"title"`
-	Repo          *string            `json:"repo"`
-	Status        *string            `json:"status"`
-	DependsOn     []byte             `json:"depends_on"`
-	BlockedReason *string            `json:"blocked_reason"`
-	Branch        *string            `json:"branch"`
-	Execution     []byte             `json:"execution"`
-	Pr            []byte             `json:"pr"`
-	WorkspacePr   []byte             `json:"workspace_pr"`
-	SourcePath    *string            `json:"source_path"`
-	SourceHash    *string            `json:"source_hash"`
-	Owner         *string            `json:"owner"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	ID                    uuid.UUID          `json:"id"`
+	WorkspaceID           uuid.UUID          `json:"workspace_id"`
+	FeatureID             uuid.UUID          `json:"feature_id"`
+	FeatureName           string             `json:"feature_name"`
+	TaskID                uuid.UUID          `json:"task_id"`
+	TaskName              string             `json:"task_name"`
+	Title                 string             `json:"title"`
+	Repo                  *string            `json:"repo"`
+	Status                *string            `json:"status"`
+	DependsOn             []byte             `json:"depends_on"`
+	BlockedReason         *string            `json:"blocked_reason"`
+	BlockedDetails        *string            `json:"blocked_details"`
+	Branch                *string            `json:"branch"`
+	Execution             []byte             `json:"execution"`
+	Pr                    []byte             `json:"pr"`
+	WorkspacePr           []byte             `json:"workspace_pr"`
+	SourcePath            *string            `json:"source_path"`
+	SourceHash            *string            `json:"source_hash"`
+	Owner                 *string            `json:"owner"`
+	DispatchHandle        *string            `json:"dispatch_handle"`
+	DispatchNonce         *string            `json:"dispatch_nonce"`
+	DispatchedAt          pgtype.Timestamptz `json:"dispatched_at"`
+	ReenqueueAttempts     int32              `json:"reenqueue_attempts"`
+	DispatchKind          *string            `json:"dispatch_kind"`
+	ReviewIncompleteCount int32              `json:"review_incomplete_count"`
+	MaxTurnsRetryCount    int32              `json:"max_turns_retry_count"`
+	RebaseAttempts        int32              `json:"rebase_attempts"`
+	ConflictState         string             `json:"conflict_state"`
+	BlockedFromStatus     *string            `json:"blocked_from_status"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
 }
