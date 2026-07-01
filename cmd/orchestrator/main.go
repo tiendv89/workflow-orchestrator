@@ -222,7 +222,9 @@ type loopConfig struct {
 //
 //	feature/handoff triggers (HIGH priority, no headroom consumed)
 //	→ handoff-PR conflict-rebase + finalize (HIGH priority, uses headroom)
-//	→ task dispatch — claim/fix/reviewer/task-rebase (leftover headroom)
+//	→ task dispatch — claim/fix/reviewer (leftover headroom)
+//	→ poll merged PRs (always — merged-is-truth invariant)
+//	→ task-rebase dispatch (leftover headroom)
 //	→ reap
 //	→ reconciler
 func runCycle(
@@ -267,7 +269,9 @@ func runCycle(
 		if inflightErr != nil {
 			log.Error().Err(inflightErr).Msg("poll: CountInFlight error — skipping dispatch this cycle")
 			hadError = true
-			// Skip all dispatch steps this cycle — safer than dispatching blind.
+			// Treat as exhausted so all dispatch steps (including task-rebase in
+			// postDispatch) are gated out via the headroom <= 0 check.
+			headroom = 0
 			goto postDispatch
 		}
 		headroom = orchestrator.Headroom(cfg.MaxInFlight, inflight)
@@ -438,9 +442,16 @@ func runCycle(
 		}
 	}
 
-	// Step d: poll GitHub for merged PRs (ground truth for done transitions).
-	// Runs before task-rebase dispatch so tasks newly set to 'conflicted' this
-	// cycle are immediately eligible for rebase dispatch in Step e.
+postDispatch:
+	// ── POST-DISPATCH: always runs regardless of headroom state ───────────────
+
+	// Step d: poll GitHub for merged PRs (ground truth for done transitions + conflict detection).
+	// Must always run — even when headroom = 0 — because the reconciler explicitly defers to
+	// PollMergedPRs for reviewing tasks with merged PRs. Skipping it when headroom is
+	// exhausted would create a permanent deadlock: all reviewing slots occupied by tasks
+	// with merged PRs, those tasks never transitioned to done, and no headroom ever freed.
+	// Trade-off: task-rebase below is still headroom-gated, so tasks newly detected as
+	// conflicted here are dispatched on the next cycle when headroom allows.
 	if lc.pollMergedPRs != nil {
 		if err := lc.pollMergedPRs(ctx, pool, workspaceID); err != nil {
 			log.Error().Err(err).Msg("poll: PollMergedPRs error")
@@ -448,9 +459,9 @@ func runCycle(
 		}
 	}
 
-	// Step e: find conflicted tasks and dispatch a rebase agent for each.
-	// Runs after Step d (pollMergedPRs) so tasks set to 'conflicted' this cycle
-	// are dispatched immediately. Uses leftover headroom from claim/fix/reviewer.
+	// Step e: find conflicted tasks and dispatch a rebase agent for each (leftover headroom).
+	// Runs after Step d so tasks set to 'conflicted' by pollMergedPRs this cycle
+	// can be dispatched immediately when headroom allows.
 	if lc.findConflicted != nil && lc.dispatchConflicted != nil {
 		conflicted, err := lc.findConflicted(ctx, pool, workspaceID)
 		if err != nil {
@@ -481,10 +492,6 @@ func runCycle(
 			}
 		}
 	}
-
-postDispatch:
-	// ── POST-DISPATCH: reap + reconcile ───────────────────────────────────────
-	// These always run regardless of headroom state.
 
 	// Step f: reap completed tasks from the broker.
 	if lc.reapCompleted != nil {

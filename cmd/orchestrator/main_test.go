@@ -714,6 +714,7 @@ func TestRunCycle_Throttle_ZeroHeadroomBlocksAllDispatch(t *testing.T) {
 	reviewerCalled := false
 	fixCalled := false
 	conflictCalled := false
+	pollMergedPRsCalled := false
 
 	task := db.WorkspaceTask{TaskID: uuid.New(), FeatureID: uuid.New(), TaskName: "T1", FeatureName: "f"}
 
@@ -762,6 +763,7 @@ func TestRunCycle_Throttle_ZeroHeadroomBlocksAllDispatch(t *testing.T) {
 			return nil
 		},
 		pollMergedPRs: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) error {
+			pollMergedPRsCalled = true
 			return nil
 		},
 		newHandle: uuid.New,
@@ -782,6 +784,9 @@ func TestRunCycle_Throttle_ZeroHeadroomBlocksAllDispatch(t *testing.T) {
 	}
 	if conflictCalled {
 		t.Error("task rebase should not be called when headroom is 0")
+	}
+	if !pollMergedPRsCalled {
+		t.Error("pollMergedPRs must run even when headroom is 0 — it guards the merged-is-truth invariant")
 	}
 }
 
@@ -915,6 +920,7 @@ func TestRunCycle_Throttle_CountInFlightError(t *testing.T) {
 	claimCalled := false
 	reapCalled := false
 	reconcileCalled := false
+	pollMergedPRsCalled := false
 
 	task := db.WorkspaceTask{TaskID: uuid.New(), FeatureID: uuid.New(), TaskName: "T1", FeatureName: "f"}
 
@@ -944,6 +950,7 @@ func TestRunCycle_Throttle_CountInFlightError(t *testing.T) {
 			return nil
 		},
 		pollMergedPRs: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) error {
+			pollMergedPRsCalled = true
 			return nil
 		},
 		newHandle: uuid.New,
@@ -961,6 +968,9 @@ func TestRunCycle_Throttle_CountInFlightError(t *testing.T) {
 	}
 	if !reconcileCalled {
 		t.Error("reconcile should still run even when CountInFlight fails")
+	}
+	if !pollMergedPRsCalled {
+		t.Error("pollMergedPRs must run even when CountInFlight fails — it guards the merged-is-truth invariant")
 	}
 }
 
