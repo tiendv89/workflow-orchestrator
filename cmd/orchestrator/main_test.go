@@ -457,3 +457,73 @@ func TestRunCycle_ContextCancelled(t *testing.T) {
 	// Must not panic even with a cancelled context.
 	runCycle(ctx, cfg, nil, wsID, hs, "test-executor", lc)
 }
+
+// TestRunCycle_ReconcileStuck_Called verifies that reconcileStuck is called each
+// cycle when wired, and that its error is isolated (reap and merge-poll still run).
+func TestRunCycle_ReconcileStuck_Called(t *testing.T) {
+	cfg := minimalCfg()
+	hs := orchestrator.NewHandleStore()
+	wsID := uuid.New()
+
+	reconcileCalled := false
+	reapCalled := false
+	pollCalled := false
+
+	lc := loopConfig{
+		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
+			return false, nil
+		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			return true, nil
+		},
+		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {
+			return nil
+		},
+		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
+			reapCalled = true
+			return nil
+		},
+		reconcileStuck: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool) error {
+			reconcileCalled = true
+			return errors.New("reconciler error")
+		},
+		pollMergedPRs: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) error {
+			pollCalled = true
+			return nil
+		},
+		newHandle: uuid.New,
+	}
+
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+
+	if !reconcileCalled {
+		t.Error("reconcileStuck should have been called")
+	}
+	if !reapCalled {
+		t.Error("reapCompleted should still be called despite reconciler error")
+	}
+	if !pollCalled {
+		t.Error("pollMergedPRs should still be called despite reconciler error")
+	}
+	if !hadError {
+		t.Error("hadError should be true when reconcileStuck returns an error")
+	}
+}
+
+// TestRunCycle_ReconcileStuck_Nil verifies that a nil reconcileStuck is safely
+// skipped — existing callers that don't wire it still work.
+func TestRunCycle_ReconcileStuck_Nil(t *testing.T) {
+	cfg := minimalCfg()
+	hs := orchestrator.NewHandleStore()
+	wsID := uuid.New()
+	lc := fixedHandleLC(nil, nil, false, nil, nil, nil, nil, nil)
+	// reconcileStuck is nil in fixedHandleLC — must not panic
+
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	if hadError {
+		t.Error("expected hadError=false with no tasks and no errors")
+	}
+}

@@ -35,15 +35,18 @@ type executorResult struct {
 // Reaper drains go-owned completions from the broker and applies DB transitions.
 // Construct via newReaper; call ReapCompleted for the default production instance.
 type Reaper struct {
-	brokerURL   string
-	httpClient  *http.Client
-	setInReview func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, prURL string) (bool, error)
-	setBlocked  func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, reason, fromStatus string) (bool, error)
-	slowLookup  func(ctx context.Context, pool *pgxpool.Pool, workspaceID uuid.UUID, featureName, taskName string) (*HandleEntry, error)
-	appendLog   func(ctx context.Context, pool *pgxpool.Pool, workspaceID, featureUUID, taskUUID uuid.UUID, action, by, note string) error
+	brokerURL          string
+	httpClient         *http.Client
+	setInReview        func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, prURL string) (bool, error)
+	setBlocked         func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, reason, fromStatus string) (bool, error)
+	setReadyMaxTurns   func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error)
+	getMaxTurnsCount   func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (int32, error)
+	slowLookup         func(ctx context.Context, pool *pgxpool.Pool, workspaceID uuid.UUID, featureName, taskName string) (*HandleEntry, error)
+	appendLog          func(ctx context.Context, pool *pgxpool.Pool, workspaceID, featureUUID, taskUUID uuid.UUID, action, by, note string) error
+	executorMaxRetries int
 }
 
-func newReaper(brokerURL string, httpClient *http.Client) *Reaper {
+func newReaper(brokerURL string, httpClient *http.Client, executorMaxRetries int) *Reaper {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 10 * time.Second}
 	}
@@ -54,8 +57,11 @@ func newReaper(brokerURL string, httpClient *http.Client) *Reaper {
 		setBlocked: func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, reason, fromStatus string) (bool, error) {
 			return SetBlockedWithDetails(ctx, pool, workspaceID, taskUUID, reason, "", fromStatus)
 		},
-		slowLookup: dbLookupTaskBySlug,
-		appendLog:  AppendLog,
+		setReadyMaxTurns:   SetReadyFromMaxTurns,
+		getMaxTurnsCount:   GetMaxTurnsRetryCount,
+		slowLookup:         dbLookupTaskBySlug,
+		appendLog:          AppendLog,
+		executorMaxRetries: executorMaxRetries,
 	}
 }
 
@@ -71,8 +77,10 @@ func blockedFromStatusForKind(kind string) string {
 
 // ReapCompleted drains up to 50 go-owned completions from the broker and applies
 // the appropriate DB status transition for each:
-//   - terminal_status "in_review" → SetInReview (records pr_url)
-//   - terminal_status "blocked"   → SetBlocked  (records blocked_reason)
+//   - terminal_status "in_review"  → SetInReview (records pr_url; resets max_turns_retry_count)
+//   - terminal_status "blocked"    → SetBlocked  (records blocked_reason)
+//   - terminal_status "failed"     → SetBlocked  (DLQ spawn failure; records blocked_reason)
+//   - terminal_status "max_turns"  → SetReadyFromMaxTurns if retries remain; else SetBlocked
 //
 // Unknown handles (not in HandleStore or DB) log a warning and are skipped.
 // Each handle is deleted from the HandleStore after successful processing.
@@ -81,7 +89,7 @@ func ReapCompleted(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, 
 	if err != nil {
 		return fmt.Errorf("reap: parse workspace id: %w", err)
 	}
-	return newReaper(cfg.BrokerURL, nil).reap(ctx, pool, hs, workspaceUUID)
+	return newReaper(cfg.BrokerURL, nil, cfg.ExecutorMaxRetries).reap(ctx, pool, hs, workspaceUUID)
 }
 
 func (r *Reaper) reap(ctx context.Context, pool *pgxpool.Pool, hs *HandleStore, workspaceUUID uuid.UUID) error {
@@ -205,6 +213,23 @@ func (r *Reaper) processOne(
 		if _, err := r.setBlocked(ctx, pool, workspaceUUID, entry.TaskUUID, c.Result.BlockedReason, fromStatus); err != nil {
 			return fmt.Errorf("SetBlocked handle=%q: %w", c.Handle, err)
 		}
+	case "failed":
+		// DLQ spawn failure: dispatcher posted a synthetic "failed" after exhausting
+		// delivery attempts. Treat as a block with the provided reason.
+		reason := c.Result.BlockedReason
+		if reason == "" {
+			reason = "spawn_dlq_failed"
+		}
+		fromStatus := blockedFromStatusForKind(c.Metadata.Kind)
+		if _, err := r.setBlocked(ctx, pool, workspaceUUID, entry.TaskUUID, reason, fromStatus); err != nil {
+			return fmt.Errorf("SetBlocked(failed) handle=%q: %w", c.Handle, err)
+		}
+	case "max_turns":
+		// Executor hit the model's max-turns limit. Retry up to executorMaxRetries;
+		// after that, block the task so a human can intervene.
+		if err := r.handleMaxTurns(ctx, pool, workspaceUUID, entry.TaskUUID, c.Handle); err != nil {
+			return err
+		}
 	default:
 		log.Warn().
 			Str("handle", c.Handle).
@@ -219,6 +244,49 @@ func (r *Reaper) processOne(
 		log.Warn().Err(err).Str("handle", c.Handle).Msg("reap: failed to append log entry")
 	}
 
+	return nil
+}
+
+// handleMaxTurns applies the max-turns FSM edge:
+//   - if max_turns_retry_count < executorMaxRetries → in_progress→ready + increment counter
+//   - else → blocked (max_turns_exceeded)
+//
+// The getMaxTurnsCount read and the subsequent SetReadyFromMaxTurns / SetBlocked
+// are not atomic: a concurrent transition could race, but SetReadyFromMaxTurns
+// is guarded on status=in_progress and SetBlocked is guarded on non-terminal,
+// so the worst case is a lost transition (the next cycle handles it) — no
+// double-spawn.
+func (r *Reaper) handleMaxTurns(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	workspaceUUID, taskUUID uuid.UUID,
+	handle string,
+) error {
+	count, err := r.getMaxTurnsCount(ctx, pool, workspaceUUID, taskUUID)
+	if err != nil {
+		return fmt.Errorf("handleMaxTurns: get count handle=%q: %w", handle, err)
+	}
+
+	if int(count) < r.executorMaxRetries {
+		if _, err := r.setReadyMaxTurns(ctx, pool, workspaceUUID, taskUUID); err != nil {
+			return fmt.Errorf("SetReadyFromMaxTurns handle=%q: %w", handle, err)
+		}
+		log.Info().
+			Str("handle", handle).
+			Int32("retry", count+1).
+			Int("max", r.executorMaxRetries).
+			Msg("reap: max-turns reset — task returned to ready")
+		return nil
+	}
+
+	if _, err := r.setBlocked(ctx, pool, workspaceUUID, taskUUID, "max_turns_exceeded", "in_progress"); err != nil {
+		return fmt.Errorf("SetBlocked(max_turns) handle=%q: %w", handle, err)
+	}
+	log.Info().
+		Str("handle", handle).
+		Int32("count", count).
+		Int("max", r.executorMaxRetries).
+		Msg("reap: max-turns cap reached — task blocked")
 	return nil
 }
 

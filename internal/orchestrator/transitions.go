@@ -118,14 +118,18 @@ func mergeExtra(a, b map[string]any) map[string]any {
 
 // SetInReview transitions a task from "in_progress" to "in_review" and records
 // the PR URL in the pr JSONB field as {"url": prURL, "status": "open"}.
-// Clears dispatch columns (dispatch-out).
+// Clears dispatch columns (dispatch-out) and resets max_turns_retry_count to 0
+// (success-exit rule: counter resets on every successful impl/fix completion).
 // Returns (false, nil) when the task was not in "in_progress".
 func SetInReview(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, prURL string) (bool, error) {
 	pr, err := json.Marshal(map[string]string{"url": prURL, "status": "open"})
 	if err != nil {
 		return false, fmt.Errorf("SetInReview: marshal pr: %w", err)
 	}
-	extra := mergeExtra(dispatchOutExtra(), map[string]any{"pr": pr})
+	extra := mergeExtra(dispatchOutExtra(), map[string]any{
+		"pr":                    pr,
+		"max_turns_retry_count": int32(0),
+	})
 	ok, err := GuardedTransition(ctx, pool, workspaceID, taskUUID, "in_progress", "in_review", extra)
 	if err != nil {
 		return false, fmt.Errorf("SetInReview: %w", err)
@@ -312,4 +316,68 @@ func SetDone(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid
 		return false, fmt.Errorf("SetDone: commit: %w", err)
 	}
 	return true, nil
+}
+
+// SetReadyFromMaxTurns transitions a task from "in_progress" to "ready" for a
+// max-turns retry, incrementing max_turns_retry_count atomically in the same
+// UPDATE. Clears dispatch columns so the next claim sees a clean slate.
+// Returns (false, nil) when the task was not in "in_progress".
+func SetReadyFromMaxTurns(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error) {
+	const sql = `
+UPDATE workspace_tasks SET
+    status                = 'ready',
+    max_turns_retry_count = max_turns_retry_count + 1,
+    dispatch_handle       = NULL,
+    dispatch_nonce        = NULL,
+    dispatched_at         = NULL,
+    dispatch_kind         = NULL,
+    updated_at            = now()
+WHERE workspace_id = $1
+  AND task_id      = $2
+  AND status       = 'in_progress'
+RETURNING id`
+
+	var id uuid.UUID
+	err := pool.QueryRow(ctx, sql, workspaceID, taskUUID).Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("SetReadyFromMaxTurns: %w", err)
+	}
+	return true, nil
+}
+
+// BumpReenqueueAttempts atomically increments reenqueue_attempts for a task and
+// returns the new count. The reconciler calls this durably before re-enqueuing
+// to Redis — if Redis fails the count is already committed, preventing unbounded
+// retry without accounting.
+func BumpReenqueueAttempts(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (int32, error) {
+	var newCount int32
+	err := pool.QueryRow(ctx,
+		`UPDATE workspace_tasks
+		 SET reenqueue_attempts = reenqueue_attempts + 1, updated_at = now()
+		 WHERE workspace_id = $1 AND task_id = $2
+		 RETURNING reenqueue_attempts`,
+		workspaceID, taskUUID,
+	).Scan(&newCount)
+	if err != nil {
+		return 0, fmt.Errorf("BumpReenqueueAttempts: %w", err)
+	}
+	return newCount, nil
+}
+
+// GetMaxTurnsRetryCount returns the current max_turns_retry_count for a task.
+// Used by the reaper to decide between retry (in_progress→ready) and block.
+func GetMaxTurnsRetryCount(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (int32, error) {
+	var count int32
+	err := pool.QueryRow(ctx,
+		`SELECT max_turns_retry_count FROM workspace_tasks
+		 WHERE workspace_id = $1 AND task_id = $2`,
+		workspaceID, taskUUID,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("GetMaxTurnsRetryCount: %w", err)
+	}
+	return count, nil
 }

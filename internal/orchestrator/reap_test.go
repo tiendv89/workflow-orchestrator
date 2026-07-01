@@ -19,7 +19,7 @@ func makeCompletionResponse(records []completionRecord) []byte {
 	return b
 }
 
-// fakeTransition captures calls to SetInReview / SetBlocked.
+// fakeTransition captures calls to SetInReview / SetBlocked / SetReadyFromMaxTurns.
 type fakeTransition struct {
 	mu            sync.Mutex
 	inReviewCalls []struct {
@@ -33,12 +33,17 @@ type fakeTransition struct {
 		reason      string
 		fromStatus  string
 	}
+	readyMaxTurnsCalls []struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}
 	logCalls []struct {
 		action string
 		note   string
 	}
 	slowLookupResult *HandleEntry
 	slowLookupErr    error
+	maxTurnsCount    int32 // returned by getMaxTurnsCount
 }
 
 func (f *fakeTransition) setInReview(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, prURL string) (bool, error) {
@@ -64,6 +69,22 @@ func (f *fakeTransition) setBlocked(_ context.Context, _ *pgxpool.Pool, workspac
 	return true, nil
 }
 
+func (f *fakeTransition) setReadyMaxTurns(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readyMaxTurnsCalls = append(f.readyMaxTurnsCalls, struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}{workspaceID, taskUUID})
+	return true, nil
+}
+
+func (f *fakeTransition) getMaxTurnsCount(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (int32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.maxTurnsCount, nil
+}
+
 func (f *fakeTransition) lookupBySlug(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID, _, _ string) (*HandleEntry, error) {
 	return f.slowLookupResult, f.slowLookupErr
 }
@@ -79,14 +100,22 @@ func (f *fakeTransition) appendLog(_ context.Context, _ *pgxpool.Pool, _, _, _ u
 }
 
 // newTestReaper wires a Reaper with a mock broker server and fake transitions.
+// executorMaxRetries defaults to 3 if 0 is passed.
 func newTestReaper(srv *httptest.Server, ft *fakeTransition) *Reaper {
+	return newTestReaperWithRetries(srv, ft, 3)
+}
+
+func newTestReaperWithRetries(srv *httptest.Server, ft *fakeTransition, executorMaxRetries int) *Reaper {
 	return &Reaper{
-		brokerURL:   srv.URL,
-		httpClient:  srv.Client(),
-		setInReview: ft.setInReview,
-		setBlocked:  ft.setBlocked,
-		slowLookup:  ft.lookupBySlug,
-		appendLog:   ft.appendLog,
+		brokerURL:          srv.URL,
+		httpClient:         srv.Client(),
+		setInReview:        ft.setInReview,
+		setBlocked:         ft.setBlocked,
+		setReadyMaxTurns:   ft.setReadyMaxTurns,
+		getMaxTurnsCount:   ft.getMaxTurnsCount,
+		slowLookup:         ft.lookupBySlug,
+		appendLog:          ft.appendLog,
+		executorMaxRetries: executorMaxRetries,
 	}
 }
 
@@ -548,5 +577,291 @@ func TestReap_SnakeCaseMetadataDecode(t *testing.T) {
 	}
 	if ft.inReviewCalls[0].prURL != "https://github.com/owner/repo/pull/10" {
 		t.Errorf("prURL = %q", ft.inReviewCalls[0].prURL)
+	}
+}
+
+// TestReap_DLQ_Failed verifies that terminal_status "failed" calls SetBlocked
+// with the provided blocked_reason (DLQ spawn-failure path).
+func TestReap_DLQ_Failed(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-dlq",
+		Metadata: handleMetadata{
+			FeatureID: "dlq-feat",
+			TaskID:    "T9",
+		},
+		Result: executorResult{
+			TerminalStatus: "failed",
+			BlockedReason:  "spawn_dlq_failed",
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("handle-dlq", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "dlq-feat",
+		TaskName:    "T9",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.blockedCalls) != 1 {
+		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
+	}
+	if ft.blockedCalls[0].taskUUID != taskUUID {
+		t.Errorf("taskUUID = %v, want %v", ft.blockedCalls[0].taskUUID, taskUUID)
+	}
+	if ft.blockedCalls[0].reason != "spawn_dlq_failed" {
+		t.Errorf("reason = %q, want spawn_dlq_failed", ft.blockedCalls[0].reason)
+	}
+	if len(ft.inReviewCalls) != 0 {
+		t.Errorf("SetInReview should not be called for 'failed' terminal status")
+	}
+	if _, found := hs.Lookup("handle-dlq"); found {
+		t.Error("handle should be deleted after processing")
+	}
+}
+
+// TestReap_DLQ_Failed_DefaultReason verifies that an empty blocked_reason on a
+// "failed" completion falls back to "spawn_dlq_failed".
+func TestReap_DLQ_Failed_DefaultReason(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-dlq-no-reason",
+		Metadata: handleMetadata{
+			FeatureID: "dlq-feat2",
+			TaskID:    "T10",
+		},
+		Result: executorResult{
+			TerminalStatus: "failed",
+			BlockedReason:  "", // empty — should default
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("handle-dlq-no-reason", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "dlq-feat2",
+		TaskName:    "T10",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.blockedCalls) != 1 {
+		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
+	}
+	if ft.blockedCalls[0].reason != "spawn_dlq_failed" {
+		t.Errorf("default reason = %q, want spawn_dlq_failed", ft.blockedCalls[0].reason)
+	}
+}
+
+// TestReap_MaxTurns_Retry verifies that terminal_status "max_turns" with a
+// retry count below executorMaxRetries resets in_progress→ready.
+func TestReap_MaxTurns_Retry(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-mt-retry",
+		Metadata: handleMetadata{
+			FeatureID: "mt-feat",
+			TaskID:    "T3",
+		},
+		Result: executorResult{
+			TerminalStatus: "max_turns",
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	// count=1 < executorMaxRetries=3 → should retry (set ready)
+	ft := &fakeTransition{maxTurnsCount: 1}
+	hs := NewHandleStore()
+	hs.Register("handle-mt-retry", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "mt-feat",
+		TaskName:    "T3",
+	})
+
+	r := newTestReaperWithRetries(srv, ft, 3)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.readyMaxTurnsCalls) != 1 {
+		t.Fatalf("SetReadyFromMaxTurns called %d times, want 1", len(ft.readyMaxTurnsCalls))
+	}
+	if ft.readyMaxTurnsCalls[0].taskUUID != taskUUID {
+		t.Errorf("taskUUID = %v, want %v", ft.readyMaxTurnsCalls[0].taskUUID, taskUUID)
+	}
+	if len(ft.blockedCalls) != 0 {
+		t.Errorf("SetBlocked should not be called when retries remain; called %d times", len(ft.blockedCalls))
+	}
+	if _, found := hs.Lookup("handle-mt-retry"); found {
+		t.Error("handle should be deleted after processing")
+	}
+}
+
+// TestReap_MaxTurns_Blocked verifies that terminal_status "max_turns" with a
+// retry count at or above executorMaxRetries blocks the task.
+func TestReap_MaxTurns_Blocked(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-mt-block",
+		Metadata: handleMetadata{
+			FeatureID: "mt-feat2",
+			TaskID:    "T4",
+		},
+		Result: executorResult{
+			TerminalStatus: "max_turns",
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	// count=3 >= executorMaxRetries=3 → should block
+	ft := &fakeTransition{maxTurnsCount: 3}
+	hs := NewHandleStore()
+	hs.Register("handle-mt-block", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "mt-feat2",
+		TaskName:    "T4",
+	})
+
+	r := newTestReaperWithRetries(srv, ft, 3)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.blockedCalls) != 1 {
+		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
+	}
+	if ft.blockedCalls[0].reason != "max_turns_exceeded" {
+		t.Errorf("reason = %q, want max_turns_exceeded", ft.blockedCalls[0].reason)
+	}
+	if len(ft.readyMaxTurnsCalls) != 0 {
+		t.Errorf("SetReadyFromMaxTurns should not be called when cap reached; called %d times", len(ft.readyMaxTurnsCalls))
+	}
+	if _, found := hs.Lookup("handle-mt-block"); found {
+		t.Error("handle should be deleted after processing")
+	}
+}
+
+// TestReap_MaxTurns_ZeroCount verifies that a max_turns event with count=0
+// (first occurrence) still retries when executorMaxRetries > 0.
+func TestReap_MaxTurns_ZeroCount(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-mt-zero",
+		Metadata: handleMetadata{
+			FeatureID: "mt-feat3",
+			TaskID:    "T5",
+		},
+		Result: executorResult{
+			TerminalStatus: "max_turns",
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	// count=0 < executorMaxRetries=3 → first occurrence; should retry
+	ft := &fakeTransition{maxTurnsCount: 0}
+	hs := NewHandleStore()
+	hs.Register("handle-mt-zero", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "mt-feat3",
+		TaskName:    "T5",
+	})
+
+	r := newTestReaperWithRetries(srv, ft, 3)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.readyMaxTurnsCalls) != 1 {
+		t.Fatalf("SetReadyFromMaxTurns called %d times, want 1", len(ft.readyMaxTurnsCalls))
+	}
+	if len(ft.blockedCalls) != 0 {
+		t.Errorf("SetBlocked should not be called on first max_turns occurrence")
 	}
 }

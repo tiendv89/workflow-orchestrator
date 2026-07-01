@@ -89,6 +89,9 @@ func main() {
 		reapCompleted: func(ctx context.Context, c *config.Config, pool *pgxpool.Pool, hs *orchestrator.HandleStore) error {
 			return orchestrator.ReapCompleted(ctx, c, pool, hs)
 		},
+		reconcileStuck: func(ctx context.Context, c *config.Config, pool *pgxpool.Pool) error {
+			return orchestrator.ReconcileStuckDispatches(ctx, c, pool, dispatcher)
+		},
 		pollMergedPRs: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error {
 			return orchestrator.PollMergedPRs(ctx, ghClient, pool, wsID)
 		},
@@ -147,13 +150,14 @@ func (s *pollState) next(hadError bool) time.Duration {
 // loopConfig holds injectable functions for each step of the poll cycle.
 // Production code wires real implementations; tests inject stubs.
 type loopConfig struct {
-	findEligible  func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
-	claimTask     func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, featureName, taskName, executor string) (bool, error)
-	rollbackClaim func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID) (bool, error)
-	dispatch      func(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error
-	reapCompleted func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, hs *orchestrator.HandleStore) error
-	pollMergedPRs func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error
-	newHandle     func() uuid.UUID
+	findEligible   func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
+	claimTask      func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, featureName, taskName, executor string) (bool, error)
+	rollbackClaim  func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID) (bool, error)
+	dispatch       func(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error
+	reapCompleted  func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, hs *orchestrator.HandleStore) error
+	reconcileStuck func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool) error
+	pollMergedPRs  func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error
+	newHandle      func() uuid.UUID
 }
 
 // runCycle executes one full poll iteration. Each step's errors are logged and
@@ -221,7 +225,15 @@ func runCycle(
 		hadError = true
 	}
 
-	// Step c: poll GitHub for merged PRs.
+	// Step c: reconcile stuck dispatches (crash/timeout recovery).
+	if lc.reconcileStuck != nil {
+		if err := lc.reconcileStuck(ctx, cfg, pool); err != nil {
+			log.Error().Err(err).Msg("poll: ReconcileStuck error")
+			hadError = true
+		}
+	}
+
+	// Step d: poll GitHub for merged PRs.
 	if err := lc.pollMergedPRs(ctx, pool, workspaceID); err != nil {
 		log.Error().Err(err).Msg("poll: PollMergedPRs error")
 		hadError = true

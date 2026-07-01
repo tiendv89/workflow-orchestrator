@@ -19,6 +19,11 @@ type Config struct {
 	BaseBranch          string
 	PollIntervalSeconds int
 	HealthPort          int
+
+	// Error/stuck recovery
+	ExecutionDeadlineMS         int // max ms a task can be in_progress/reviewing; default 7200000 (2h)
+	DispatchReconcileMaxRetries int // reconciler re-enqueue cap before block; default 3
+	ExecutorMaxRetries          int // max-turns reset cap before block; default 3
 }
 
 // Load reads configuration from environment variables. Returns an error if any
@@ -57,6 +62,36 @@ func Load() (*Config, error) {
 			errs = append(errs, fmt.Errorf("HEALTH_PORT must be an integer: %w", err))
 		} else {
 			cfg.HealthPort = n
+		}
+	}
+
+	cfg.ExecutionDeadlineMS = 7200000
+	if raw := os.Getenv("EXECUTION_DEADLINE_MS"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("EXECUTION_DEADLINE_MS must be an integer: %w", err))
+		} else {
+			cfg.ExecutionDeadlineMS = n
+		}
+	}
+
+	cfg.DispatchReconcileMaxRetries = 3
+	if raw := os.Getenv("DISPATCH_RECONCILE_MAX_RETRIES"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("DISPATCH_RECONCILE_MAX_RETRIES must be an integer: %w", err))
+		} else {
+			cfg.DispatchReconcileMaxRetries = n
+		}
+	}
+
+	cfg.ExecutorMaxRetries = 3
+	if raw := os.Getenv("EXECUTOR_MAX_RETRIES"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("EXECUTOR_MAX_RETRIES must be an integer: %w", err))
+		} else {
+			cfg.ExecutorMaxRetries = n
 		}
 	}
 
