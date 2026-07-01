@@ -11,6 +11,7 @@ import (
 
 	"github.com/tiendv89/workflow-orchestrator/internal/config"
 	db "github.com/tiendv89/workflow-orchestrator/internal/database/queries"
+	gh "github.com/tiendv89/workflow-orchestrator/internal/github"
 )
 
 // Reconciler scans for stuck in_progress/reviewing dispatches and either
@@ -23,12 +24,29 @@ type Reconciler struct {
 	bumpAttempts func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (int32, error)
 	setBlocked   func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, reason, details, fromStatus string) (bool, error)
 	enqueue      func(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle, nonce, kind string) error
-	maxRetries   int
-	deadlineMS   int
+	// isMerged is an optional check: given a PR URL, returns true when the PR is
+	// already merged. When non-nil, reconcileOne skips re-enqueue for reviewing
+	// tasks whose PR is already merged — PollMergedPRs (later in the same cycle)
+	// will mark those tasks done cleanly.
+	isMerged   func(ctx context.Context, prURL string) (bool, error)
+	maxRetries int
+	deadlineMS int
 }
 
 // newReconciler wires a production Reconciler backed by the provided Dispatcher.
-func newReconciler(d *Dispatcher, maxRetries, deadlineMS int) *Reconciler {
+// ghClient is used to skip re-enqueueing reviewing tasks whose PR is already
+// merged (nil disables the check, e.g. in unit tests that don't wire a client).
+func newReconciler(d *Dispatcher, ghClient gh.PRGetter, maxRetries, deadlineMS int) *Reconciler {
+	var isMerged func(ctx context.Context, prURL string) (bool, error)
+	if ghClient != nil {
+		isMerged = func(ctx context.Context, prURL string) (bool, error) {
+			status, err := ghClient.GetPR(ctx, prURL)
+			if err != nil {
+				return false, err
+			}
+			return status.Merged, nil
+		}
+	}
 	return &Reconciler{
 		findStuck: func(ctx context.Context, q *db.Queries, workspaceID uuid.UUID) ([]db.WorkspaceTask, error) {
 			return q.ListInProgressAndReviewingForOwner(ctx, workspaceID)
@@ -36,6 +54,7 @@ func newReconciler(d *Dispatcher, maxRetries, deadlineMS int) *Reconciler {
 		bumpAttempts: BumpReenqueueAttempts,
 		setBlocked:   SetBlockedWithDetails,
 		enqueue:      d.EnqueueExisting,
+		isMerged:     isMerged,
 		maxRetries:   maxRetries,
 		deadlineMS:   deadlineMS,
 	}
@@ -44,12 +63,16 @@ func newReconciler(d *Dispatcher, maxRetries, deadlineMS int) *Reconciler {
 // ReconcileStuckDispatches is the production entry point. It queries all
 // in_progress/reviewing go-owned tasks, filters those whose dispatched_at is
 // older than cfg.ExecutionDeadlineMS, and processes each one.
-func ReconcileStuckDispatches(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, d *Dispatcher) error {
+//
+// ghClient is used to skip re-enqueueing reviewing tasks whose PR is already
+// merged (the same-cycle PollMergedPRs step will mark them done). Pass nil to
+// disable the check (e.g. when the GitHub client is unavailable).
+func ReconcileStuckDispatches(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, d *Dispatcher, ghClient gh.PRGetter) error {
 	workspaceUUID, err := uuid.Parse(cfg.WorkspaceID)
 	if err != nil {
 		return fmt.Errorf("reconcile: parse workspace id: %w", err)
 	}
-	return newReconciler(d, cfg.DispatchReconcileMaxRetries, cfg.ExecutionDeadlineMS).
+	return newReconciler(d, ghClient, cfg.DispatchReconcileMaxRetries, cfg.ExecutionDeadlineMS).
 		reconcile(ctx, cfg, pool, workspaceUUID)
 }
 
@@ -99,6 +122,27 @@ func (r *Reconciler) reconcileOne(
 	fromStatus := ""
 	if task.Status != nil {
 		fromStatus = *task.Status
+	}
+
+	// For reviewing tasks: skip re-enqueue when the PR is already merged.
+	// PollMergedPRs (later in the same cycle) will transition the task to done.
+	// GitHub API errors are non-fatal — log and continue to re-enqueue.
+	if fromStatus == "reviewing" && r.isMerged != nil {
+		if prURL := extractPRURL(task.Pr); prURL != "" {
+			merged, err := r.isMerged(ctx, prURL)
+			if err != nil {
+				log.Warn().Err(err).
+					Str("task", task.TaskName).
+					Str("pr_url", prURL).
+					Msg("reconciler: GetPR failed — proceeding with re-enqueue")
+			} else if merged {
+				log.Debug().
+					Str("task", task.TaskName).
+					Str("pr_url", prURL).
+					Msg("reconciler: PR already merged — skipping re-enqueue")
+				return nil
+			}
+		}
 	}
 
 	if task.ReenqueueAttempts >= int32(r.maxRetries) {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/tiendv89/workflow-orchestrator/internal/config"
 	db "github.com/tiendv89/workflow-orchestrator/internal/database/queries"
+	gh "github.com/tiendv89/workflow-orchestrator/internal/github"
 )
 
 // MaxReviewIncompletes is the maximum number of consecutive no-valid-verdict
@@ -24,6 +25,12 @@ const MaxReviewIncompletes = 2
 // review_incomplete→reviewing). First-push-wins: returns (false, nil) if
 // another instance won the claim.
 //
+// When ghClient is non-nil, the task's PR is checked for merged status before
+// the claim is attempted. A merged PR means the task is about to be marked done
+// by PollMergedPRs; dispatching a reviewer would be wasteful and the guarded
+// transition would be a no-op anyway. Skip silently so PollMergedPRs handles
+// the transition cleanly on the same cycle.
+//
 // On claim success, registers the handle in the HandleStore and dispatches a
 // broker "review" job. If broker dispatch fails, the reviewer claim is rolled
 // back to the original fromStatus.
@@ -35,7 +42,24 @@ func DispatchReviewer(
 	task db.WorkspaceTask,
 	dispatcher *Dispatcher,
 	hs *HandleStore,
+	ghClient gh.PRGetter,
 ) (bool, error) {
+	// Skip reviewer dispatch if the PR is already merged — PollMergedPRs (same
+	// cycle, later step) will transition the task to done. Avoids one wasted
+	// reviewer run per merge event.
+	if ghClient != nil {
+		if prURL := extractPRURL(task.Pr); prURL != "" {
+			status, err := ghClient.GetPR(ctx, prURL)
+			if err == nil && status.Merged {
+				log.Debug().
+					Str("task", task.TaskName).
+					Str("pr_url", prURL).
+					Msg("DispatchReviewer: PR already merged — skipping reviewer dispatch")
+				return false, nil
+			}
+		}
+	}
+
 	fromStatus := taskStatus(task)
 	handle := uuid.New().String()
 	nonce := uuid.New().String()

@@ -90,7 +90,7 @@ func main() {
 			return orchestrator.FindReviewableTasks(ctx, pool, wsID)
 		},
 		dispatchReviewer: func(ctx context.Context, pool *pgxpool.Pool, c *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error) {
-			return orchestrator.DispatchReviewer(ctx, pool, c, wsID, task, dispatcher, hs)
+			return orchestrator.DispatchReviewer(ctx, pool, c, wsID, task, dispatcher, hs, ghClient)
 		},
 		findFixable: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error) {
 			return orchestrator.FindFixableTasks(ctx, pool, wsID)
@@ -102,7 +102,7 @@ func main() {
 			return orchestrator.ReapCompleted(ctx, c, pool, hs)
 		},
 		reconcileStuck: func(ctx context.Context, c *config.Config, pool *pgxpool.Pool) error {
-			return orchestrator.ReconcileStuckDispatches(ctx, c, pool, dispatcher)
+			return orchestrator.ReconcileStuckDispatches(ctx, c, pool, dispatcher, ghClient)
 		},
 		pollMergedPRs: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error {
 			return orchestrator.PollMergedPRs(ctx, ghClient, pool, wsID)

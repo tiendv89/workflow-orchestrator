@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/tiendv89/workflow-orchestrator/internal/config"
 	"github.com/tiendv89/workflow-orchestrator/internal/database/queries"
 	"github.com/tiendv89/workflow-orchestrator/internal/github"
 	"github.com/tiendv89/workflow-orchestrator/internal/orchestrator"
@@ -712,5 +715,63 @@ func TestHandleRebaseCompletion_PathB_CapReached(t *testing.T) {
 	// conflict_state should be 'conflicted' (cleared from resolving, not blocked).
 	if task.ConflictState != "conflicted" {
 		t.Errorf("conflict_state = %q, want conflicted (Path B stays conflicted)", task.ConflictState)
+	}
+}
+
+// ---- DispatchRebase rollback tests ----
+
+// TestDispatchRebase_DispatchFailure_DoesNotBurnCap verifies that when the
+// broker dispatch fails, the rebase_attempts counter is NOT incremented.
+// The old code used MarkRebaseRetry (which increments the counter) as the
+// rollback; the fix uses rollbackResolving (which does not).
+func TestDispatchRebase_DispatchFailure_DoesNotBurnCap(t *testing.T) {
+	ctx := context.Background()
+	pool := openPool(t)
+	fx := setupFixture(t, ctx, pool)
+
+	// Start with rebase_attempts=1 and conflict_state='conflicted'.
+	taskID := insertTaskWithConflictState(t, ctx, pool, fx, "in_review", "conflicted", 1)
+
+	// Set up an always-failing broker dispatcher (HTTP server that returns 500).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	hs := orchestrator.NewHandleStore()
+	// Fetch the task from DB so it has all fields (workspace_id, task_id, etc.).
+	task := getTaskRow(t, ctx, pool, fx, taskID)
+
+	// Build a minimal Dispatcher pointed at the failing broker. The streamer and
+	// DB querier are nil because the broker rejects at /register before stream
+	// or DB are touched.
+	d := orchestrator.NewDispatcher(srv.URL, nil, nil, nil)
+
+	cfg := &config.Config{
+		WorkspaceID:    fx.workspaceID.String(),
+		OrganizationID: "org-test",
+		BrokerURL:      srv.URL,
+		ManagementRepo: "owner/mgmt",
+		BaseBranch:     "main",
+	}
+
+	ok, err := orchestrator.DispatchRebase(ctx, cfg, pool, hs, d, task)
+	// Dispatch should fail (broker returns 500).
+	if err == nil {
+		t.Fatal("expected DispatchRebase to return an error when broker fails")
+	}
+	if ok {
+		t.Error("expected ok=false when dispatch fails")
+	}
+
+	// The key assertion: rebase_attempts must still be 1 (not incremented).
+	after := getRebaseAttempts(t, ctx, pool, fx, taskID)
+	if after != 1 {
+		t.Errorf("rebase_attempts = %d after rollback, want 1 (must not be burned on dispatch failure)", after)
+	}
+
+	// conflict_state must be 'conflicted' (rolled back from 'resolving').
+	if cs := getConflictState(t, ctx, pool, fx, taskID); cs != "conflicted" {
+		t.Errorf("conflict_state = %q after rollback, want conflicted", cs)
 	}
 }

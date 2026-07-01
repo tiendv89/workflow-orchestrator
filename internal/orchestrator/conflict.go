@@ -276,6 +276,35 @@ func HandleRebaseCompletion(
 	return nil
 }
 
+// rollbackResolving transitions conflict_state from 'resolving' back to
+// 'conflicted' and clears dispatch columns WITHOUT incrementing rebase_attempts.
+// Used exclusively as a rollback when the broker dispatch itself fails — the
+// rebase never executed, so the attempt counter must not be burned.
+func rollbackResolving(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error) {
+	const sql = `
+UPDATE workspace_tasks SET
+    conflict_state  = 'conflicted',
+    dispatch_handle = NULL,
+    dispatch_nonce  = NULL,
+    dispatched_at   = NULL,
+    dispatch_kind   = NULL,
+    updated_at      = now()
+WHERE workspace_id   = $1
+  AND task_id        = $2
+  AND conflict_state = 'resolving'
+RETURNING id`
+
+	var id uuid.UUID
+	err := pool.QueryRow(ctx, sql, workspaceID, taskUUID).Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("rollbackResolving: %w", err)
+	}
+	return true, nil
+}
+
 // DispatchRebase claims the rebase slot and enqueues a rebase job for a
 // conflicted task. Returns (true, nil) if the claim + dispatch succeeded,
 // (false, nil) if another agent already won the claim, and (false, err) on error.
@@ -302,11 +331,14 @@ func DispatchRebase(
 	// Register + enqueue the rebase job with the SAME nonce just persisted by
 	// SetResolving above — the executor's /callback validates against it.
 	if err := dispatcher.DispatchWithNonce(ctx, cfg, task, handle, nonce, "rebase"); err != nil {
-		// Rollback: clear resolving state back to conflicted so the next cycle retries.
-		if _, rbErr := MarkRebaseRetry(ctx, pool, task.WorkspaceID, task.TaskID); rbErr != nil {
+		// Rollback: clear resolving state back to conflicted WITHOUT burning the
+		// rebase_attempts counter. MarkRebaseRetry would count this as a failed
+		// rebase execution, but the rebase never ran — only the broker dispatch
+		// failed (transient infra issue). Use rollbackResolving instead.
+		if _, rbErr := rollbackResolving(ctx, pool, task.WorkspaceID, task.TaskID); rbErr != nil {
 			log.Warn().Err(rbErr).
 				Str("task_name", task.TaskName).
-				Msg("DispatchRebase: MarkRebaseRetry (rollback) failed")
+				Msg("DispatchRebase: rollback failed — task may be stuck in resolving")
 		}
 		return false, fmt.Errorf("DispatchRebase: dispatch: %w", err)
 	}
