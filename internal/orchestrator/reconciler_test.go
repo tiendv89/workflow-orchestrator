@@ -356,3 +356,69 @@ func TestReconciler_MultipleTasksPartialBlock(t *testing.T) {
 		t.Errorf("enqueued handle = %q, want h2", deps.enqueueCalls[0].handle)
 	}
 }
+
+// TestReconciler_SkipsMergedReviewingTask verifies that a stuck "reviewing"
+// task whose PR is already merged is not re-enqueued or blocked. PollMergedPRs
+// (later in the cycle) will mark it done; re-enqueuing would dispatch a
+// redundant reviewer.
+func TestReconciler_SkipsMergedReviewingTask(t *testing.T) {
+	wsID := uuid.New()
+	prURL := "https://github.com/o/r/pull/99"
+	prJSON := []byte(`{"url":"` + prURL + `","status":"open"}`)
+
+	task := makeDispatchedTask("feat", "T-merged", "h-merged", "n-merged", "review", 0, "reviewing")
+	task.Pr = prJSON
+
+	deps := &fakeReconcilerDeps{bumpReturn: 1}
+	r := newTestReconciler(deps, []db.WorkspaceTask{task}, 3, 7200000)
+
+	// Wire isMerged to return true for the task's PR URL.
+	r.isMerged = func(_ context.Context, gotURL string) (bool, error) {
+		if gotURL != prURL {
+			t.Errorf("isMerged called with unexpected URL %q", gotURL)
+		}
+		return true, nil
+	}
+
+	if err := r.reconcile(context.Background(), nil, nil, wsID); err != nil {
+		t.Fatalf("reconcile error: %v", err)
+	}
+
+	if len(deps.bumpCalls) != 0 {
+		t.Errorf("bumpAttempts should not be called for a merged reviewing task; got %d calls", len(deps.bumpCalls))
+	}
+	if len(deps.enqueueCalls) != 0 {
+		t.Errorf("enqueue should not be called for a merged reviewing task; got %d calls", len(deps.enqueueCalls))
+	}
+	if len(deps.blockedCalls) != 0 {
+		t.Errorf("setBlocked should not be called for a merged reviewing task; got %d calls", len(deps.blockedCalls))
+	}
+}
+
+// TestReconciler_MergedCheckError_ProceedsToReenqueue verifies that when
+// isMerged returns an error, the reconciler logs and proceeds to re-enqueue
+// (error is non-fatal — better to re-enqueue than silently drop the task).
+func TestReconciler_MergedCheckError_ProceedsToReenqueue(t *testing.T) {
+	wsID := uuid.New()
+	prURL := "https://github.com/o/r/pull/88"
+	prJSON := []byte(`{"url":"` + prURL + `","status":"open"}`)
+
+	task := makeDispatchedTask("feat", "T-err", "h-err", "n-err", "review", 0, "reviewing")
+	task.Pr = prJSON
+
+	deps := &fakeReconcilerDeps{bumpReturn: 1}
+	r := newTestReconciler(deps, []db.WorkspaceTask{task}, 3, 7200000)
+
+	r.isMerged = func(_ context.Context, _ string) (bool, error) {
+		return false, errors.New("github: 503 service unavailable")
+	}
+
+	if err := r.reconcile(context.Background(), nil, nil, wsID); err != nil {
+		t.Fatalf("reconcile error: %v", err)
+	}
+
+	// Should still re-enqueue despite the API error.
+	if len(deps.enqueueCalls) != 1 {
+		t.Errorf("enqueue should be called once when isMerged errors; got %d calls", len(deps.enqueueCalls))
+	}
+}

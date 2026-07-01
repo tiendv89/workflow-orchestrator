@@ -19,9 +19,9 @@ func makeCompletionResponse(records []completionRecord) []byte {
 	return b
 }
 
-// fakeTransition captures calls to SetInReview / SetBlocked / SetReadyFromMaxTurns
-// and the verdict routing functions added by T7 (SetReviewPassed,
-// SetChangeRequested, HandleNoVerdict).
+// fakeTransition captures calls to SetInReview / SetBlocked / SetReadyFromMaxTurns,
+// the verdict routing functions added by T7 (SetReviewPassed, SetChangeRequested,
+// HandleNoVerdict), and HandleRebaseCompletion.
 type fakeTransition struct {
 	mu            sync.Mutex
 	inReviewCalls []struct {
@@ -51,6 +51,12 @@ type fakeTransition struct {
 		workspaceID uuid.UUID
 		taskUUID    uuid.UUID
 		max         int
+	}
+	rebaseCalls []struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+		success     bool
+		maxAttempts int
 	}
 	logCalls []struct {
 		action string
@@ -131,6 +137,18 @@ func (f *fakeTransition) handleNoVerdict(_ context.Context, _ *pgxpool.Pool, wor
 	return true, nil
 }
 
+func (f *fakeTransition) handleRebaseResult(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, success bool, maxAttempts int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rebaseCalls = append(f.rebaseCalls, struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+		success     bool
+		maxAttempts int
+	}{workspaceID, taskUUID, success, maxAttempts})
+	return nil
+}
+
 func (f *fakeTransition) lookupBySlug(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID, _, _ string) (*HandleEntry, error) {
 	return f.slowLookupResult, f.slowLookupErr
 }
@@ -156,6 +174,7 @@ func newTestReaperWithRetries(srv *httptest.Server, ft *fakeTransition, executor
 		brokerURL:          srv.URL,
 		httpClient:         srv.Client(),
 		maxReviewIncompls:  MaxReviewIncompletes,
+		maxRebaseAttempts:  3,
 		setInReview:        ft.setInReview,
 		setBlocked:         ft.setBlocked,
 		setReviewPassed:    ft.setReviewPassed,
@@ -163,6 +182,7 @@ func newTestReaperWithRetries(srv *httptest.Server, ft *fakeTransition, executor
 		handleNoVerdict:    ft.handleNoVerdict,
 		setReadyMaxTurns:   ft.setReadyMaxTurns,
 		getMaxTurnsCount:   ft.getMaxTurnsCount,
+		handleRebaseResult: ft.handleRebaseResult,
 		slowLookup:         ft.lookupBySlug,
 		appendLog:          ft.appendLog,
 		executorMaxRetries: executorMaxRetries,
@@ -919,5 +939,228 @@ func TestReap_MaxTurns_ZeroCount(t *testing.T) {
 	}
 	if len(ft.blockedCalls) != 0 {
 		t.Errorf("SetBlocked should not be called on first max_turns occurrence")
+	}
+}
+
+// TestReap_RebaseSuccess verifies terminal_status "rebase_success" routes to
+// handleRebaseResult with success=true.
+func TestReap_RebaseSuccess(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "rebase-handle-001",
+		Metadata: handleMetadata{
+			Kind:      "rebase",
+			FeatureID: "my-feature",
+			TaskID:    "T1",
+		},
+		Result: executorResult{TerminalStatus: "rebase_success"},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("rebase-handle-001", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "my-feature",
+		TaskName:    "T1",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.rebaseCalls) != 1 {
+		t.Fatalf("handleRebaseResult called %d times, want 1", len(ft.rebaseCalls))
+	}
+	call := ft.rebaseCalls[0]
+	if !call.success {
+		t.Error("expected success=true for rebase_success")
+	}
+	if call.taskUUID != taskUUID {
+		t.Errorf("taskUUID = %v, want %v", call.taskUUID, taskUUID)
+	}
+	if call.maxAttempts != 3 {
+		t.Errorf("maxAttempts = %d, want 3", call.maxAttempts)
+	}
+	// SetBlocked and SetInReview must not be called.
+	if len(ft.blockedCalls) != 0 {
+		t.Errorf("SetBlocked called unexpectedly")
+	}
+}
+
+// TestReap_RebaseFailed verifies terminal_status "rebase_failed" routes to
+// handleRebaseResult with success=false.
+func TestReap_RebaseFailed(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "rebase-handle-002",
+		Metadata: handleMetadata{
+			Kind:      "rebase",
+			FeatureID: "my-feature",
+			TaskID:    "T2",
+		},
+		Result: executorResult{TerminalStatus: "rebase_failed"},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("rebase-handle-002", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "my-feature",
+		TaskName:    "T2",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.rebaseCalls) != 1 {
+		t.Fatalf("handleRebaseResult called %d times, want 1", len(ft.rebaseCalls))
+	}
+	if ft.rebaseCalls[0].success {
+		t.Error("expected success=false for rebase_failed")
+	}
+}
+
+// TestReap_Blocked_RebaseKind verifies that a "blocked" completion for a
+// "rebase" kind job routes to handleRebaseResult (not SetBlocked).
+func TestReap_Blocked_RebaseKind(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "rebase-handle-003",
+		Metadata: handleMetadata{
+			Kind:      "rebase",
+			FeatureID: "my-feature",
+			TaskID:    "T3",
+		},
+		Result: executorResult{TerminalStatus: "blocked", BlockedReason: "rebase_conflict"},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("rebase-handle-003", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "my-feature",
+		TaskName:    "T3",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	// Must route to handleRebaseResult, not SetBlocked.
+	if len(ft.rebaseCalls) != 1 {
+		t.Fatalf("handleRebaseResult called %d times, want 1", len(ft.rebaseCalls))
+	}
+	if ft.rebaseCalls[0].success {
+		t.Error("expected success=false for blocked rebase job")
+	}
+	if len(ft.blockedCalls) != 0 {
+		t.Errorf("SetBlocked called unexpectedly for rebase kind")
+	}
+}
+
+// TestReap_Blocked_ImplKind verifies that a "blocked" completion for a non-rebase
+// kind (e.g. "impl") routes to SetBlocked as before.
+func TestReap_Blocked_ImplKind(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "impl-handle-001",
+		Metadata: handleMetadata{
+			Kind:      "impl",
+			FeatureID: "my-feature",
+			TaskID:    "T4",
+		},
+		Result: executorResult{TerminalStatus: "blocked", BlockedReason: "tests_failed"},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("impl-handle-001", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "my-feature",
+		TaskName:    "T4",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	// Must route to SetBlocked, not handleRebaseResult.
+	if len(ft.blockedCalls) != 1 {
+		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
+	}
+	if ft.blockedCalls[0].reason != "tests_failed" {
+		t.Errorf("blocked reason = %q, want tests_failed", ft.blockedCalls[0].reason)
+	}
+	if len(ft.rebaseCalls) != 0 {
+		t.Errorf("handleRebaseResult called unexpectedly for impl kind")
 	}
 }

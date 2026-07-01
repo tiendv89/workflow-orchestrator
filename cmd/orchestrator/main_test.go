@@ -587,3 +587,107 @@ func TestRunCycle_ReconcileStuck_Nil(t *testing.T) {
 		t.Error("expected hadError=false with no tasks and no errors")
 	}
 }
+
+// TestRunCycle_ConflictDispatch_Called verifies that the conflict dispatch step
+// (Step g) is executed when findConflicted and dispatchConflicted are wired,
+// and that it is called for each conflicted task returned.
+func TestRunCycle_ConflictDispatch_Called(t *testing.T) {
+	cfg := minimalCfg()
+	hs := orchestrator.NewHandleStore()
+	wsID := uuid.New()
+
+	conflictDispatchCalled := false
+
+	lc := loopConfig{
+		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
+			return false, nil
+		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			return true, nil
+		},
+		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {
+			return nil
+		},
+		findConflicted: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return []db.WorkspaceTask{{TaskName: "T8", FeatureName: "go-orchestrator-autonomy"}}, nil
+		},
+		dispatchConflicted: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			conflictDispatchCalled = true
+			return true, nil
+		},
+		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
+			return nil
+		},
+		pollMergedPRs: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) error {
+			return nil
+		},
+		newHandle: uuid.New,
+	}
+
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	if hadError {
+		t.Error("expected hadError=false on conflict dispatch happy path")
+	}
+	if !conflictDispatchCalled {
+		t.Error("expected dispatchConflicted to be called for conflicted task")
+	}
+}
+
+// TestRunCycle_ConflictDispatch_Nil verifies that nil findConflicted/dispatchConflicted
+// are safely skipped — existing callers that don't wire them still work.
+func TestRunCycle_ConflictDispatch_Nil(t *testing.T) {
+	cfg := minimalCfg()
+	hs := orchestrator.NewHandleStore()
+	wsID := uuid.New()
+	lc := fixedHandleLC(nil, nil, false, nil, nil, nil, nil, nil)
+	// findConflicted and dispatchConflicted are nil in fixedHandleLC — must not panic
+
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	if hadError {
+		t.Error("expected hadError=false with nil conflict dispatch functions")
+	}
+}
+
+// TestRunCycle_ConflictDispatch_Error verifies that a dispatchConflicted error
+// is isolated — the cycle continues and returns hadError=true.
+func TestRunCycle_ConflictDispatch_Error(t *testing.T) {
+	cfg := minimalCfg()
+	hs := orchestrator.NewHandleStore()
+	wsID := uuid.New()
+
+	lc := loopConfig{
+		findEligible: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		claimTask: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID, _, _, _ string) (bool, error) {
+			return false, nil
+		},
+		rollbackClaim: func(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (bool, error) {
+			return true, nil
+		},
+		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {
+			return nil
+		},
+		findConflicted: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return []db.WorkspaceTask{{TaskName: "T8", FeatureName: "go-orchestrator-autonomy"}}, nil
+		},
+		dispatchConflicted: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			return false, errors.New("broker unavailable")
+		},
+		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
+			return nil
+		},
+		pollMergedPRs: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) error {
+			return nil
+		},
+		newHandle: uuid.New,
+	}
+
+	hadError := runCycle(context.Background(), cfg, nil, wsID, hs, "test-executor", lc)
+	if !hadError {
+		t.Error("expected hadError=true when dispatchConflicted fails")
+	}
+}

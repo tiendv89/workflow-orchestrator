@@ -65,6 +65,10 @@ func TestLoad_AllPresent(t *testing.T) {
 	if cfg.ExecutorMaxRetries != 3 {
 		t.Errorf("ExecutorMaxRetries default = %d, want 3", cfg.ExecutorMaxRetries)
 	}
+	// conflict resolution defaults
+	if cfg.MaxRebaseAttempts != 3 {
+		t.Errorf("MaxRebaseAttempts default = %d, want 3", cfg.MaxRebaseAttempts)
+	}
 }
 
 func TestLoad_RecoveryConfigOverrides(t *testing.T) {
@@ -169,5 +173,28 @@ func TestLoad_PartialMissing(t *testing.T) {
 	_, err := config.Load()
 	if err == nil {
 		t.Fatal("expected error for partial missing env vars, got nil")
+	}
+}
+
+func TestLoad_MaxRebaseAttemptsOverride(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MAX_REBASE_ATTEMPTS", "5")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxRebaseAttempts != 5 {
+		t.Errorf("MaxRebaseAttempts = %d, want 5", cfg.MaxRebaseAttempts)
+	}
+}
+
+func TestLoad_InvalidMaxRebaseAttempts(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MAX_REBASE_ATTEMPTS", "not-a-number")
+
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("expected error for invalid MAX_REBASE_ATTEMPTS, got nil")
 	}
 }

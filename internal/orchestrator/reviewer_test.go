@@ -17,6 +17,9 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+
+	db "github.com/tiendv89/workflow-orchestrator/internal/database/queries"
+	gh "github.com/tiendv89/workflow-orchestrator/internal/github"
 )
 
 // --- Reap verdict routing tests ---
@@ -480,5 +483,71 @@ func TestDispatch_DefaultKindIsImpl(t *testing.T) {
 	}
 	if job.Kind != "impl" {
 		t.Errorf("Dispatch() job.Kind = %q, want impl (regression)", job.Kind)
+	}
+}
+
+// --- DispatchReviewer merged-PR skip tests ---
+
+// fakePRGetter is a lightweight gh.PRGetter stub for unit tests.
+type fakePRGetter struct {
+	merged bool
+	err    error
+}
+
+func (f *fakePRGetter) GetPR(_ context.Context, _ string) (*gh.PRStatus, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &gh.PRStatus{Merged: f.merged}, nil
+}
+
+// prTaskWithURL returns a minimal WorkspaceTask with a PR URL in the Pr field.
+func prTaskWithURL(prURL string) db.WorkspaceTask {
+	return db.WorkspaceTask{
+		FeatureName: "feat",
+		TaskName:    "T1",
+		Pr:          []byte(`{"url":"` + prURL + `","status":"open"}`),
+	}
+}
+
+// TestDispatchReviewer_MergedPR_Skips verifies that DispatchReviewer returns
+// (false, nil) without touching the DB when the ghClient reports the PR merged.
+func TestDispatchReviewer_MergedPR_Skips(t *testing.T) {
+	task := prTaskWithURL("https://github.com/o/r/pull/1")
+	ghClient := &fakePRGetter{merged: true}
+
+	// pool is nil — if the function touches it, it will panic, failing the test.
+	won, err := DispatchReviewer(context.Background(), nil, nil, uuid.New(), task, nil, nil, ghClient)
+	if err != nil {
+		t.Fatalf("DispatchReviewer error: %v", err)
+	}
+	if won {
+		t.Error("DispatchReviewer: expected won=false for merged PR, got true")
+	}
+}
+
+// TestDispatchReviewer_NotMergedPR_DoesNotSkip verifies that when the PR is
+// not merged, DispatchReviewer proceeds past the merged check and attempts
+// SetReviewing (as evidenced by the nil pool panic being recovered here).
+func TestDispatchReviewer_NotMergedPR_DoesNotSkip(t *testing.T) {
+	task := prTaskWithURL("https://github.com/o/r/pull/4")
+	ghClient := &fakePRGetter{merged: false}
+
+	// With merged=false the function should NOT short-circuit; it will proceed
+	// to SetReviewing and panic on the nil pool. Recover the panic — that is the
+	// confirmation that the code DID proceed past the merged check.
+	panicked := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+			}
+		}()
+		//nolint:errcheck
+		DispatchReviewer(context.Background(), nil, nil, uuid.New(), task, nil, nil, ghClient)
+	}()
+
+	if !panicked {
+		t.Error("expected nil-pool panic (proof that merged check did not short-circuit), got clean return")
 	}
 }

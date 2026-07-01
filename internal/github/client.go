@@ -14,6 +14,10 @@ import (
 type PRStatus struct {
 	Merged bool
 	State  string
+	// Mergeable is GitHub's mergeability assessment: "MERGEABLE", "CONFLICTING", or "UNKNOWN".
+	// "UNKNOWN" means GitHub has not finished computing mergeability — callers should recheck later.
+	// "CONFLICTING" means the PR cannot be merged without resolving conflicts.
+	Mergeable string
 }
 
 // PRGetter is a narrow interface for fetching a PR's merge status.
@@ -65,14 +69,15 @@ func (c *Client) GetPR(ctx context.Context, prURL string) (*PRStatus, error) {
 	}
 
 	var body struct {
-		Merged bool   `json:"merged"`
-		State  string `json:"state"`
+		Merged    bool   `json:"merged"`
+		State     string `json:"state"`
+		Mergeable string `json:"mergeable"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, fmt.Errorf("GetPR: decode response: %w", err)
 	}
 
-	return &PRStatus{Merged: body.Merged, State: body.State}, nil
+	return &PRStatus{Merged: body.Merged, State: body.State, Mergeable: body.Mergeable}, nil
 }
 
 // htmlURLToAPIURL converts a GitHub PR HTML URL to its REST API equivalent.

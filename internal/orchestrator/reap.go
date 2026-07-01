@@ -38,6 +38,8 @@ type Reaper struct {
 	brokerURL          string
 	httpClient         *http.Client
 	maxReviewIncompls  int
+	executorMaxRetries int
+	maxRebaseAttempts  int
 	setInReview        func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, prURL string) (bool, error)
 	setBlocked         func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, reason, fromStatus string) (bool, error)
 	setReviewPassed    func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error)
@@ -45,17 +47,20 @@ type Reaper struct {
 	handleNoVerdict    func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, max int) (bool, error)
 	setReadyMaxTurns   func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error)
 	getMaxTurnsCount   func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (int32, error)
+	handleRebaseResult func(ctx context.Context, pool *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, success bool, maxAttempts int) error
 	slowLookup         func(ctx context.Context, pool *pgxpool.Pool, workspaceID uuid.UUID, featureName, taskName string) (*HandleEntry, error)
 	appendLog          func(ctx context.Context, pool *pgxpool.Pool, workspaceID, featureUUID, taskUUID uuid.UUID, action, by, note string) error
-	executorMaxRetries int
 }
 
-func newReaper(brokerURL string, httpClient *http.Client, maxReviewIncompls, executorMaxRetries int) *Reaper {
+func newReaper(brokerURL string, httpClient *http.Client, maxReviewIncompls, executorMaxRetries, maxRebaseAttempts int) *Reaper {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 10 * time.Second}
 	}
 	if maxReviewIncompls <= 0 {
 		maxReviewIncompls = MaxReviewIncompletes
+	}
+	if maxRebaseAttempts <= 0 {
+		maxRebaseAttempts = 3
 	}
 	return &Reaper{
 		brokerURL:         brokerURL,
@@ -76,9 +81,11 @@ func newReaper(brokerURL string, httpClient *http.Client, maxReviewIncompls, exe
 		},
 		setReadyMaxTurns:   SetReadyFromMaxTurns,
 		getMaxTurnsCount:   GetMaxTurnsRetryCount,
+		handleRebaseResult: HandleRebaseCompletion,
 		slowLookup:         dbLookupTaskBySlug,
 		appendLog:          AppendLog,
 		executorMaxRetries: executorMaxRetries,
+		maxRebaseAttempts:  maxRebaseAttempts,
 	}
 }
 
@@ -99,9 +106,15 @@ func blockedFromStatusForKind(kind string) string {
 //   - terminal_status "change_requested" → SetChangeRequested (REQUEST_CHANGES verdict)
 //   - terminal_status "blocked" or any unrecognised status when kind=="review"
 //     → HandleNoVerdict (review_incomplete or blocked after MAX_REVIEW_INCOMPLETES)
+//   - terminal_status "blocked" (rebase) → HandleRebaseCompletion(success=false)
 //   - terminal_status "blocked" (impl/fix) → SetBlocked (records blocked_reason)
+//   - terminal_status "rebase_success"   → HandleRebaseCompletion(success=true)
+//   - terminal_status "rebase_failed"    → HandleRebaseCompletion(success=false)
 //   - terminal_status "failed"     → SetBlocked  (DLQ spawn failure; records blocked_reason)
 //   - terminal_status "max_turns"  → SetReadyFromMaxTurns if retries remain; else SetBlocked
+//
+// Terminal rows (done/cancelled) in the DB no-op against all guarded transitions,
+// so a late or lost completion arriving for an already-done task is safe.
 //
 // Unknown handles (not in HandleStore or DB) log a warning and are skipped.
 // Each handle is deleted from the HandleStore after successful processing.
@@ -110,7 +123,7 @@ func ReapCompleted(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, 
 	if err != nil {
 		return fmt.Errorf("reap: parse workspace id: %w", err)
 	}
-	return newReaper(cfg.BrokerURL, nil, MaxReviewIncompletes, cfg.ExecutorMaxRetries).reap(ctx, pool, hs, workspaceUUID)
+	return newReaper(cfg.BrokerURL, nil, MaxReviewIncompletes, cfg.ExecutorMaxRetries, cfg.MaxRebaseAttempts).reap(ctx, pool, hs, workspaceUUID)
 }
 
 func (r *Reaper) reap(ctx context.Context, pool *pgxpool.Pool, hs *HandleStore, workspaceUUID uuid.UUID) error {
@@ -242,14 +255,30 @@ func (r *Reaper) processOne(
 		if _, err := r.setChangeRequested(ctx, pool, workspaceUUID, entry.TaskUUID); err != nil {
 			return fmt.Errorf("SetChangeRequested handle=%q: %w", c.Handle, err)
 		}
+	case "rebase_success":
+		// Rebase completed successfully — clear resolving state.
+		if err := r.handleRebaseResult(ctx, pool, workspaceUUID, entry.TaskUUID, true, r.maxRebaseAttempts); err != nil {
+			return fmt.Errorf("handleRebaseResult(success) handle=%q: %w", c.Handle, err)
+		}
+	case "rebase_failed":
+		// Rebase failed — retry or block based on cap and task path.
+		if err := r.handleRebaseResult(ctx, pool, workspaceUUID, entry.TaskUUID, false, r.maxRebaseAttempts); err != nil {
+			return fmt.Errorf("handleRebaseResult(failed) handle=%q: %w", c.Handle, err)
+		}
 	case "blocked":
-		if isReviewKind {
+		switch {
+		case isReviewKind:
 			// Reviewer blocked without a valid verdict → no-valid-verdict path.
 			if _, err := r.handleNoVerdict(ctx, pool, workspaceUUID, entry.TaskUUID, r.maxReviewIncompls); err != nil {
 				return fmt.Errorf("HandleNoVerdict handle=%q: %w", c.Handle, err)
 			}
-		} else {
-			// Impl/fix/rebase completion that blocked.
+		case c.Metadata.Kind == "rebase":
+			// A rebase job's "blocked" result is treated as rebase failure so the cap logic applies.
+			if err := r.handleRebaseResult(ctx, pool, workspaceUUID, entry.TaskUUID, false, r.maxRebaseAttempts); err != nil {
+				return fmt.Errorf("handleRebaseResult(blocked-as-failed) handle=%q: %w", c.Handle, err)
+			}
+		default:
+			// Impl/fix completion that blocked.
 			fromStatus := blockedFromStatusForKind(c.Metadata.Kind)
 			if _, err := r.setBlocked(ctx, pool, workspaceUUID, entry.TaskUUID, c.Result.BlockedReason, fromStatus); err != nil {
 				return fmt.Errorf("SetBlocked handle=%q: %w", c.Handle, err)

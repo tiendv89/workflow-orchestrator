@@ -13,16 +13,21 @@ import (
 	gh "github.com/tiendv89/workflow-orchestrator/internal/github"
 )
 
-// PollMergedPRs scans all go-owned tasks in in_review, reviewing, or
-// review_passed status that have a PR URL. For each task, it checks the GitHub
-// API to see if the PR has been merged. If merged, it transitions the task to
-// "done" and auto-readies any dependents — all within a single DB transaction.
+// PollMergedPRs scans all go-owned tasks in "in_review", "reviewing", or
+// "review_passed" status that have a PR URL stored in the pr JSONB field.
 //
-// Covering all three pre-done statuses implements the merged-PR-is-ground-truth
-// rule: a reviewer can auto-merge the PR while the task is still "reviewing"
-// (verdict not yet reaped). Without checking "reviewing" and "review_passed"
-// here, such tasks would be stuck until the verdict is reaped or the reconciler
-// fires.
+// For each task it fetches the PR from GitHub and applies:
+//   - Merged (merged=true): SetDoneFromMergedPR — ground-truth: the merged PR
+//     supersedes any in-flight reviewer result, regardless of task status.
+//     Implements the merged-PR-is-ground-truth rule: a reviewer can auto-merge
+//     the PR while the task is still "reviewing" (verdict not yet reaped).
+//     Without checking "reviewing" and "review_passed" here, such tasks would
+//     be stuck until the verdict is reaped or the reconciler fires.
+//   - Conflicting (mergeable="CONFLICTING"): SetConflicted — marks the conflict
+//     for the rebase dispatch loop.
+//   - Unknown (mergeable="UNKNOWN"): skip — GitHub has not finished computing
+//     mergeability; recheck on the next poll cycle.
+//   - Open, no conflict: no action.
 //
 // GitHub API errors for individual PRs are logged as warnings and do not abort
 // the poll; the loop continues to the next task.
@@ -38,7 +43,7 @@ func PollMergedPRs(ctx context.Context, ghClient gh.PRGetter, pool *pgxpool.Pool
 	}
 
 	for _, task := range tasks {
-		if err := processMergedPR(ctx, ghClient, pool, workspaceID, task); err != nil {
+		if err := processPRPoll(ctx, ghClient, pool, workspaceID, task); err != nil {
 			log.Error().Err(err).
 				Str("task_name", task.TaskName).
 				Msg("PollMergedPRs: processing task failed")
@@ -47,9 +52,9 @@ func PollMergedPRs(ctx context.Context, ghClient gh.PRGetter, pool *pgxpool.Pool
 	return nil
 }
 
-// processMergedPR handles a single in_review task: checks GitHub and, if the
-// PR is merged, applies the done transition + auto-ready in one transaction.
-func processMergedPR(
+// processPRPoll handles a single task: checks GitHub and applies the appropriate
+// transition based on the PR's merged/mergeable state.
+func processPRPoll(
 	ctx context.Context,
 	ghClient gh.PRGetter,
 	pool *pgxpool.Pool,
@@ -58,7 +63,7 @@ func processMergedPR(
 ) error {
 	prURL := extractPRURL(task.Pr)
 	if prURL == "" {
-		return nil // no URL stored yet — skip silently
+		return nil
 	}
 
 	status, err := ghClient.GetPR(ctx, prURL)
@@ -67,27 +72,49 @@ func processMergedPR(
 			Str("pr_url", prURL).
 			Str("task_name", task.TaskName).
 			Msg("GetPR failed; skipping task")
-		return nil // non-fatal: continue to next task
-	}
-	if !status.Merged {
-		return nil // PR still open — nothing to do
+		return nil
 	}
 
-	// SetDoneFromMergedPR accepts in_review, reviewing, or review_passed —
-	// implements merged-PR-is-ground-truth (guarded; auto-readies dependents).
-	ok, err := SetDoneFromMergedPR(ctx, pool, workspaceID, task.TaskID)
-	if err != nil {
-		return fmt.Errorf("SetDoneFromMergedPR: %w", err)
-	}
-	if ok {
-		// Append done activity log entry only when the transition was applied.
-		if err := AppendLog(ctx, pool, workspaceID, task.FeatureID, task.TaskID,
-			"done", "orchestrator", "PR merged — task marked done."); err != nil {
-			log.Warn().Err(err).
-				Str("task_name", task.TaskName).
-				Msg("AppendLog done failed; transition already committed")
+	// Merged-is-ground-truth: a merged PR transitions the task to done from any
+	// of in_review/reviewing/review_passed (guarded by SetDoneFromMergedPR's WHERE).
+	if status.Merged {
+		ok, err := SetDoneFromMergedPR(ctx, pool, workspaceID, task.TaskID)
+		if err != nil {
+			return fmt.Errorf("SetDoneFromMergedPR: %w", err)
 		}
+		if ok {
+			if err := AppendLog(ctx, pool, workspaceID, task.FeatureID, task.TaskID,
+				"done", "orchestrator", "PR merged — task marked done."); err != nil {
+				log.Warn().Err(err).
+					Str("task_name", task.TaskName).
+					Msg("AppendLog done failed; transition already committed")
+			}
+		}
+		return nil
 	}
+
+	// Conflict detection: CONFLICTING → SetConflicted (skip if already resolving).
+	// UNKNOWN → skip (GitHub not done computing; recheck next cycle).
+	switch status.Mergeable {
+	case "CONFLICTING":
+		if task.ConflictState == ConflictStateResolving {
+			// Rebase in-flight; do not interrupt.
+			return nil
+		}
+		ok, err := SetConflicted(ctx, pool, workspaceID, task.TaskID)
+		if err != nil {
+			return fmt.Errorf("SetConflicted: %w", err)
+		}
+		if ok {
+			log.Info().
+				Str("task_name", task.TaskName).
+				Str("pr_url", prURL).
+				Msg("conflict detected — conflict_state set to conflicted")
+		}
+	case "UNKNOWN":
+		// GitHub has not computed mergeability yet; skip and recheck next poll.
+	}
+
 	return nil
 }
 
