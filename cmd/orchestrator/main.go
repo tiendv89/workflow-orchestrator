@@ -107,6 +107,12 @@ func main() {
 		pollMergedPRs: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error {
 			return orchestrator.PollMergedPRs(ctx, ghClient, pool, wsID)
 		},
+		findConflicted: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error) {
+			return orchestrator.FindConflictedTasks(ctx, pool, wsID)
+		},
+		dispatchConflicted: func(ctx context.Context, pool *pgxpool.Pool, c *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error) {
+			return orchestrator.DispatchRebase(ctx, c, pool, hs, dispatcher, task)
+		},
 		newHandle: uuid.New,
 	}
 
@@ -162,18 +168,20 @@ func (s *pollState) next(hadError bool) time.Duration {
 // loopConfig holds injectable functions for each step of the poll cycle.
 // Production code wires real implementations; tests inject stubs.
 type loopConfig struct {
-	findEligible     func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
-	claimTask        func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, featureName, taskName, executor string) (bool, error)
-	rollbackClaim    func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID) (bool, error)
-	dispatch         func(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error
-	findReviewable   func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
-	dispatchReviewer func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error)
-	findFixable      func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
-	dispatchFix      func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error)
-	reapCompleted    func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, hs *orchestrator.HandleStore) error
-	reconcileStuck   func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool) error
-	pollMergedPRs    func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error
-	newHandle        func() uuid.UUID
+	findEligible       func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
+	claimTask          func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, featureName, taskName, executor string) (bool, error)
+	rollbackClaim      func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID) (bool, error)
+	dispatch           func(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error
+	findReviewable     func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
+	dispatchReviewer   func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error)
+	findFixable        func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
+	dispatchFix        func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error)
+	reapCompleted      func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, hs *orchestrator.HandleStore) error
+	reconcileStuck     func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool) error
+	pollMergedPRs      func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error
+	findConflicted     func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
+	dispatchConflicted func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error)
+	newHandle          func() uuid.UUID
 }
 
 // runCycle executes one full poll iteration. Each step's errors are logged and
@@ -305,9 +313,37 @@ func runCycle(
 	}
 
 	// Step f: poll GitHub for merged PRs (ground truth for done transitions).
+	// Also detects CONFLICTING mergeable state → sets conflict_state='conflicted'.
 	if err := lc.pollMergedPRs(ctx, pool, workspaceID); err != nil {
 		log.Error().Err(err).Msg("poll: PollMergedPRs error")
 		hadError = true
+	}
+
+	// Step g: find conflicted tasks and dispatch a rebase agent for each.
+	// Runs after Step f so tasks set to 'conflicted' this cycle are dispatched immediately.
+	if lc.findConflicted != nil && lc.dispatchConflicted != nil {
+		conflicted, err := lc.findConflicted(ctx, pool, workspaceID)
+		if err != nil {
+			log.Error().Err(err).Msg("poll: FindConflictedTasks")
+			hadError = true
+		} else {
+			for _, task := range conflicted {
+				won, rebaseErr := lc.dispatchConflicted(ctx, pool, cfg, workspaceID, task, hs)
+				if rebaseErr != nil {
+					log.Error().Err(rebaseErr).Str("task", task.TaskName).Msg("poll: DispatchRebase error")
+					hadError = true
+					continue
+				}
+				if !won {
+					log.Debug().Str("task", task.TaskName).Msg("poll: rebase claim lost — another instance won")
+					continue
+				}
+				log.Info().
+					Str("task", task.TaskName).
+					Str("feature", task.FeatureName).
+					Msg("poll: rebase dispatched")
+			}
+		}
 	}
 
 	log.Debug().Msg("poll cycle complete")

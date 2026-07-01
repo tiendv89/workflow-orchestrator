@@ -692,6 +692,11 @@ func TestHandleRebaseCompletion_PathA_CapReached(t *testing.T) {
 	if task.BlockedReason == nil || *task.BlockedReason != "rebase_failed" {
 		t.Errorf("blocked_reason = %v, want rebase_failed", task.BlockedReason)
 	}
+	// conflict_state must NOT be 'resolving' — a stale resolving state permanently
+	// blinds SetConflicted's guard after a human unblocks the task.
+	if task.ConflictState == "resolving" {
+		t.Error("conflict_state must not remain 'resolving' after Path A block — breaks future conflict detection after human unblock")
+	}
 }
 
 // TestHandleRebaseCompletion_PathB_CapReached verifies that a review_passed task

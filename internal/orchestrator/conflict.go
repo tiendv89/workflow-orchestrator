@@ -258,6 +258,13 @@ func HandleRebaseCompletion(
 				Msg("HandleRebaseCompletion: Path B rebase cap reached — task stays conflicted; human must resolve") // TODO(slack)
 		} else {
 			// Path A: block the task.
+			// Exit 'resolving' first — SetBlockedWithDetails only updates status, not
+			// conflict_state. A stale 'resolving' state would permanently blind future
+			// conflict detection for this task after a human unblocks it, because
+			// SetConflicted guards on `conflict_state != 'resolving'`.
+			if _, err := rollbackResolving(ctx, pool, workspaceID, taskUUID); err != nil {
+				return fmt.Errorf("HandleRebaseCompletion: rollbackResolving (Path A cap): %w", err)
+			}
 			if _, err := SetBlockedWithDetails(ctx, pool, workspaceID, taskUUID,
 				"rebase_failed",
 				fmt.Sprintf("rebase failed after %d attempts", nextAttempts),
