@@ -19,7 +19,9 @@ func makeCompletionResponse(records []completionRecord) []byte {
 	return b
 }
 
-// fakeTransition captures calls to SetInReview / SetBlocked / SetReadyFromMaxTurns.
+// fakeTransition captures calls to SetInReview / SetBlocked / SetReadyFromMaxTurns
+// and the verdict routing functions added by T7 (SetReviewPassed,
+// SetChangeRequested, HandleNoVerdict).
 type fakeTransition struct {
 	mu            sync.Mutex
 	inReviewCalls []struct {
@@ -36,6 +38,19 @@ type fakeTransition struct {
 	readyMaxTurnsCalls []struct {
 		workspaceID uuid.UUID
 		taskUUID    uuid.UUID
+	}
+	reviewPassedCalls []struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}
+	changeRequestedCalls []struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}
+	noVerdictCalls []struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+		max         int
 	}
 	logCalls []struct {
 		action string
@@ -85,6 +100,37 @@ func (f *fakeTransition) getMaxTurnsCount(_ context.Context, _ *pgxpool.Pool, _,
 	return f.maxTurnsCount, nil
 }
 
+func (f *fakeTransition) setReviewPassed(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reviewPassedCalls = append(f.reviewPassedCalls, struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}{workspaceID, taskUUID})
+	return true, nil
+}
+
+func (f *fakeTransition) setChangeRequested(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.changeRequestedCalls = append(f.changeRequestedCalls, struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}{workspaceID, taskUUID})
+	return true, nil
+}
+
+func (f *fakeTransition) handleNoVerdict(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, max int) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.noVerdictCalls = append(f.noVerdictCalls, struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+		max         int
+	}{workspaceID, taskUUID, max})
+	return true, nil
+}
+
 func (f *fakeTransition) lookupBySlug(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID, _, _ string) (*HandleEntry, error) {
 	return f.slowLookupResult, f.slowLookupErr
 }
@@ -109,8 +155,12 @@ func newTestReaperWithRetries(srv *httptest.Server, ft *fakeTransition, executor
 	return &Reaper{
 		brokerURL:          srv.URL,
 		httpClient:         srv.Client(),
+		maxReviewIncompls:  MaxReviewIncompletes,
 		setInReview:        ft.setInReview,
 		setBlocked:         ft.setBlocked,
+		setReviewPassed:    ft.setReviewPassed,
+		setChangeRequested: ft.setChangeRequested,
+		handleNoVerdict:    ft.handleNoVerdict,
 		setReadyMaxTurns:   ft.setReadyMaxTurns,
 		getMaxTurnsCount:   ft.getMaxTurnsCount,
 		slowLookup:         ft.lookupBySlug,
@@ -280,7 +330,10 @@ func TestReap_GoCompletion_Blocked_ImplKind(t *testing.T) {
 }
 
 // TestReap_GoCompletion_Blocked_ReviewKind verifies that a go completion with
-// terminal_status "blocked" from a review dispatch records blocked_from_status="reviewing".
+// terminal_status "blocked" from a review dispatch is treated as a no-valid-verdict
+// outcome (HandleNoVerdict), per technical-design.md's FSM: reviewing's only blocked
+// transition is "no valid verdict (>= MAX)" via review_incomplete — an agent-reported
+// block from a reviewer is not distinguished from any other missing verdict.
 func TestReap_GoCompletion_Blocked_ReviewKind(t *testing.T) {
 	taskUUID := uuid.New()
 	featureUUID := uuid.New()
@@ -324,15 +377,18 @@ func TestReap_GoCompletion_Blocked_ReviewKind(t *testing.T) {
 
 	ft.mu.Lock()
 	defer ft.mu.Unlock()
-	if len(ft.blockedCalls) != 1 {
-		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
+	if len(ft.blockedCalls) != 0 {
+		t.Errorf("SetBlocked called %d times, want 0 — review-kind blocked routes through HandleNoVerdict", len(ft.blockedCalls))
 	}
-	call := ft.blockedCalls[0]
-	if call.fromStatus != "reviewing" {
-		t.Errorf("fromStatus = %q, want reviewing for review dispatch kind", call.fromStatus)
+	if len(ft.noVerdictCalls) != 1 {
+		t.Fatalf("HandleNoVerdict called %d times, want 1", len(ft.noVerdictCalls))
 	}
-	if call.reason != "missing_tool" {
-		t.Errorf("reason = %q, want missing_tool", call.reason)
+	call := ft.noVerdictCalls[0]
+	if call.taskUUID != taskUUID {
+		t.Errorf("taskUUID = %v, want %v", call.taskUUID, taskUUID)
+	}
+	if call.max != MaxReviewIncompletes {
+		t.Errorf("max = %d, want %d", call.max, MaxReviewIncompletes)
 	}
 }
 

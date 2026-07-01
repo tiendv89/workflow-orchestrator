@@ -183,6 +183,18 @@ func fixedHandleLC(
 			}
 			return dispatchErr
 		},
+		findReviewable: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		dispatchReviewer: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			return false, nil
+		},
+		findFixable: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		dispatchFix: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			return false, nil
+		},
 		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
 			return reapErr
 		},
@@ -229,6 +241,18 @@ func TestRunCycle_FindEligibleError(t *testing.T) {
 		},
 		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {
 			return nil
+		},
+		findReviewable: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		dispatchReviewer: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			return false, nil
+		},
+		findFixable: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		dispatchFix: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			return false, nil
 		},
 		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
 			reapCalled = true
@@ -301,6 +325,18 @@ func TestRunCycle_ClaimLost(t *testing.T) {
 			dispatchCalled = true
 			return nil
 		},
+		findReviewable: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		dispatchReviewer: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			return false, nil
+		},
+		findFixable: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		dispatchFix: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			return false, nil
+		},
 		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
 			return nil
 		},
@@ -360,6 +396,18 @@ func TestRunCycle_DispatchError(t *testing.T) {
 			usedHandle = handle
 			return errors.New("broker unreachable")
 		},
+		findReviewable: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		dispatchReviewer: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			return false, nil
+		},
+		findFixable: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		dispatchFix: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			return false, nil
+		},
 		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
 			return nil
 		},
@@ -412,6 +460,18 @@ func TestRunCycle_HappyPath(t *testing.T) {
 		},
 		dispatch: func(_ context.Context, _ *config.Config, _ db.WorkspaceTask, _ string) error {
 			return nil
+		},
+		findReviewable: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		dispatchReviewer: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			return false, nil
+		},
+		findFixable: func(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID) ([]db.WorkspaceTask, error) {
+			return nil, nil
+		},
+		dispatchFix: func(_ context.Context, _ *pgxpool.Pool, _ *config.Config, _ uuid.UUID, _ db.WorkspaceTask, _ *orchestrator.HandleStore) (bool, error) {
+			return false, nil
 		},
 		reapCompleted: func(_ context.Context, _ *config.Config, _ *pgxpool.Pool, _ *orchestrator.HandleStore) error {
 			return nil

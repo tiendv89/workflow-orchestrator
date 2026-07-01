@@ -280,6 +280,88 @@ RETURNING id, task_name`
 	return true, nil
 }
 
+// ClaimFix atomically claims a task for fix dispatch by transitioning
+// change_requested → in_progress with dispatch-in metadata columns set.
+// First-push-wins: returns (false, nil) if another caller won the race.
+func ClaimFix(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	workspaceID, taskUUID uuid.UUID,
+	handle, nonce string,
+) (bool, error) {
+	extra := dispatchInExtra(handle, nonce, "fix")
+	ok, err := GuardedTransition(ctx, pool, workspaceID, taskUUID, "change_requested", "in_progress", extra)
+	if err != nil {
+		return false, fmt.Errorf("ClaimFix: %w", err)
+	}
+	return ok, nil
+}
+
+// HandleNoVerdict processes a no-valid-verdict outcome from a reviewer.
+// If the task's review_incomplete_count is below max, the task is transitioned
+// to review_incomplete and the count is incremented. If at or above max, the
+// task is blocked with reason "review_incomplete_exceeded".
+//
+// Returns (true, nil) when a transition was applied; (false, nil) when the task
+// was not in "reviewing" state (another instance already handled it).
+func HandleNoVerdict(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	workspaceID, taskUUID uuid.UUID,
+	max int,
+) (bool, error) {
+	// Step 1: try to set review_incomplete if count < max.
+	const sqlIncomplete = `
+UPDATE workspace_tasks SET
+    status                  = 'review_incomplete',
+    review_incomplete_count = review_incomplete_count + 1,
+    dispatch_handle         = NULL,
+    dispatch_nonce          = NULL,
+    dispatched_at           = NULL,
+    dispatch_kind           = NULL,
+    updated_at              = now()
+WHERE workspace_id            = $1
+  AND task_id                 = $2
+  AND status                  = 'reviewing'
+  AND review_incomplete_count < $3
+RETURNING id`
+
+	var id uuid.UUID
+	err := pool.QueryRow(ctx, sqlIncomplete, workspaceID, taskUUID, max).Scan(&id)
+	if err == nil {
+		return true, nil // transitioned to review_incomplete
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("HandleNoVerdict: review_incomplete update: %w", err)
+	}
+
+	// Step 2: count >= max (or task no longer reviewing); try to block.
+	const sqlBlock = `
+UPDATE workspace_tasks SET
+    status                  = 'blocked',
+    blocked_reason          = 'review_incomplete_exceeded',
+    blocked_from_status     = 'reviewing',
+    review_incomplete_count = review_incomplete_count + 1,
+    dispatch_handle         = NULL,
+    dispatch_nonce          = NULL,
+    dispatched_at           = NULL,
+    dispatch_kind           = NULL,
+    updated_at              = now()
+WHERE workspace_id = $1
+  AND task_id      = $2
+  AND status       = 'reviewing'
+RETURNING id`
+
+	err = pool.QueryRow(ctx, sqlBlock, workspaceID, taskUUID).Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil // task already handled by another instance
+		}
+		return false, fmt.Errorf("HandleNoVerdict: blocked update: %w", err)
+	}
+	return true, nil
+}
+
 // SetDone transitions a task from "in_review" to "done" and, in the same
 // transaction, advances any go-owned todo tasks whose full dependency set is
 // now satisfied (AutoReadyDependents).

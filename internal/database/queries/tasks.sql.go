@@ -557,3 +557,154 @@ func (q *Queries) ListInProgressAndReviewingForOwner(ctx context.Context, worksp
 	}
 	return items, nil
 }
+
+const listChangeRequestedTasksForOwner = `-- name: ListChangeRequestedTasksForOwner :many
+SELECT
+    id, workspace_id, feature_id, feature_name, task_id, task_name, title,
+    repo, status, depends_on, blocked_reason, blocked_details, branch,
+    execution, pr, workspace_pr, source_path, source_hash, owner,
+    dispatch_handle, dispatch_nonce, dispatched_at, reenqueue_attempts,
+    dispatch_kind, review_incomplete_count, max_turns_retry_count,
+    rebase_attempts, conflict_state, blocked_from_status, created_at, updated_at
+FROM workspace_tasks
+WHERE workspace_id = $1
+  AND owner        = $2
+  AND status       = 'change_requested'
+  AND pr           IS NOT NULL
+  AND pr->>'url'   IS NOT NULL
+ORDER BY updated_at ASC
+`
+
+type ListChangeRequestedTasksForOwnerParams struct {
+	WorkspaceID uuid.UUID `json:"workspace_id"`
+	Owner       *string   `json:"owner"`
+}
+
+// Returns go-owned tasks in change_requested status with a PR URL set.
+func (q *Queries) ListChangeRequestedTasksForOwner(ctx context.Context, arg ListChangeRequestedTasksForOwnerParams) ([]WorkspaceTask, error) {
+	rows, err := q.db.Query(ctx, listChangeRequestedTasksForOwner, arg.WorkspaceID, arg.Owner)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WorkspaceTask{}
+	for rows.Next() {
+		var i WorkspaceTask
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.FeatureID,
+			&i.FeatureName,
+			&i.TaskID,
+			&i.TaskName,
+			&i.Title,
+			&i.Repo,
+			&i.Status,
+			&i.DependsOn,
+			&i.BlockedReason,
+			&i.BlockedDetails,
+			&i.Branch,
+			&i.Execution,
+			&i.Pr,
+			&i.WorkspacePr,
+			&i.SourcePath,
+			&i.SourceHash,
+			&i.Owner,
+			&i.DispatchHandle,
+			&i.DispatchNonce,
+			&i.DispatchedAt,
+			&i.ReenqueueAttempts,
+			&i.DispatchKind,
+			&i.ReviewIncompleteCount,
+			&i.MaxTurnsRetryCount,
+			&i.RebaseAttempts,
+			&i.ConflictState,
+			&i.BlockedFromStatus,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMergeablePRTasksForOwner = `-- name: ListMergeablePRTasksForOwner :many
+SELECT
+    id, workspace_id, feature_id, feature_name, task_id, task_name, title,
+    repo, status, depends_on, blocked_reason, blocked_details, branch,
+    execution, pr, workspace_pr, source_path, source_hash, owner,
+    dispatch_handle, dispatch_nonce, dispatched_at, reenqueue_attempts,
+    dispatch_kind, review_incomplete_count, max_turns_retry_count,
+    rebase_attempts, conflict_state, blocked_from_status, created_at, updated_at
+FROM workspace_tasks
+WHERE workspace_id = $1
+  AND owner        = $2
+  AND status       IN ('in_review', 'reviewing', 'review_passed')
+  AND pr           IS NOT NULL
+  AND pr->>'url'   IS NOT NULL
+ORDER BY updated_at ASC
+`
+
+type ListMergeablePRTasksForOwnerParams struct {
+	WorkspaceID uuid.UUID `json:"workspace_id"`
+	Owner       *string   `json:"owner"`
+}
+
+// Returns go-owned tasks in in_review, reviewing, or review_passed status with
+// a PR URL. Used by PollMergedPRs to detect merged PRs (ground truth).
+func (q *Queries) ListMergeablePRTasksForOwner(ctx context.Context, arg ListMergeablePRTasksForOwnerParams) ([]WorkspaceTask, error) {
+	rows, err := q.db.Query(ctx, listMergeablePRTasksForOwner, arg.WorkspaceID, arg.Owner)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WorkspaceTask{}
+	for rows.Next() {
+		var i WorkspaceTask
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.FeatureID,
+			&i.FeatureName,
+			&i.TaskID,
+			&i.TaskName,
+			&i.Title,
+			&i.Repo,
+			&i.Status,
+			&i.DependsOn,
+			&i.BlockedReason,
+			&i.BlockedDetails,
+			&i.Branch,
+			&i.Execution,
+			&i.Pr,
+			&i.WorkspacePr,
+			&i.SourcePath,
+			&i.SourceHash,
+			&i.Owner,
+			&i.DispatchHandle,
+			&i.DispatchNonce,
+			&i.DispatchedAt,
+			&i.ReenqueueAttempts,
+			&i.DispatchKind,
+			&i.ReviewIncompleteCount,
+			&i.MaxTurnsRetryCount,
+			&i.RebaseAttempts,
+			&i.ConflictState,
+			&i.BlockedFromStatus,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

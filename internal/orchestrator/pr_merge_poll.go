@@ -13,18 +13,23 @@ import (
 	gh "github.com/tiendv89/workflow-orchestrator/internal/github"
 )
 
-// PollMergedPRs scans all go-owned tasks in "in_review" status that have a PR
-// URL stored in the pr JSONB field. For each task, it checks the GitHub API to
-// see if the PR has been merged. If merged, it transitions the task to "done"
-// and auto-readies any dependents — all within a single DB transaction. A
-// "done" activity log entry is appended after the transaction commits.
+// PollMergedPRs scans all go-owned tasks in in_review, reviewing, or
+// review_passed status that have a PR URL. For each task, it checks the GitHub
+// API to see if the PR has been merged. If merged, it transitions the task to
+// "done" and auto-readies any dependents — all within a single DB transaction.
+//
+// Covering all three pre-done statuses implements the merged-PR-is-ground-truth
+// rule: a reviewer can auto-merge the PR while the task is still "reviewing"
+// (verdict not yet reaped). Without checking "reviewing" and "review_passed"
+// here, such tasks would be stuck until the verdict is reaped or the reconciler
+// fires.
 //
 // GitHub API errors for individual PRs are logged as warnings and do not abort
 // the poll; the loop continues to the next task.
 func PollMergedPRs(ctx context.Context, ghClient gh.PRGetter, pool *pgxpool.Pool, workspaceID uuid.UUID) error {
 	owner := "go"
 	q := queries.New(pool)
-	tasks, err := q.ListInReviewTasksForOwner(ctx, queries.ListInReviewTasksForOwnerParams{
+	tasks, err := q.ListMergeablePRTasksForOwner(ctx, queries.ListMergeablePRTasksForOwnerParams{
 		WorkspaceID: workspaceID,
 		Owner:       &owner,
 	})
@@ -68,10 +73,11 @@ func processMergedPR(
 		return nil // PR still open — nothing to do
 	}
 
-	// SetDone transitions in_review → done and auto-readies dependents in one tx.
-	ok, err := SetDone(ctx, pool, workspaceID, task.TaskID)
+	// SetDoneFromMergedPR accepts in_review, reviewing, or review_passed —
+	// implements merged-PR-is-ground-truth (guarded; auto-readies dependents).
+	ok, err := SetDoneFromMergedPR(ctx, pool, workspaceID, task.TaskID)
 	if err != nil {
-		return fmt.Errorf("SetDone: %w", err)
+		return fmt.Errorf("SetDoneFromMergedPR: %w", err)
 	}
 	if ok {
 		// Append done activity log entry only when the transition was applied.
