@@ -90,3 +90,40 @@ func TestGetPR_HTMLURLConversion(t *testing.T) {
 		t.Error("expected Merged=true")
 	}
 }
+
+// TestGetPR_MergeableField verifies that the mergeable field is decoded and
+// propagated correctly in PRStatus.
+func TestGetPR_MergeableField(t *testing.T) {
+	tests := []struct {
+		name      string
+		mergeable string
+	}{
+		{"MERGEABLE", "MERGEABLE"},
+		{"CONFLICTING", "CONFLICTING"},
+		{"UNKNOWN", "UNKNOWN"},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+					"merged":    false,
+					"state":     "open",
+					"mergeable": tc.mergeable,
+				})
+			}))
+			defer srv.Close()
+
+			c := github.NewClient("tok")
+			status, err := c.GetPR(context.Background(), srv.URL+"/repos/o/r/pulls/1")
+			if err != nil {
+				t.Fatalf("GetPR: %v", err)
+			}
+			if status.Mergeable != tc.mergeable {
+				t.Errorf("Mergeable = %q, want %q", status.Mergeable, tc.mergeable)
+			}
+		})
+	}
+}

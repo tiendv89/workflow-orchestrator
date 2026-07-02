@@ -387,7 +387,6 @@ func TestDispatch_DerivesTaskRepoBranchWhenMissing(t *testing.T) {
 	}
 }
 
-
 // TestDispatch_ModelFromPolicy verifies that the dispatched job contains the model
 // returned by the workspace policy when a DB querier is configured.
 func TestDispatch_ModelFromPolicy(t *testing.T) {
@@ -437,5 +436,55 @@ func TestDispatch_ModelFallbackOnDBError(t *testing.T) {
 	}
 	if job.ImplementationModel != defaultImplementationModel {
 		t.Errorf("ImplementationModel = %q, want %q", job.ImplementationModel, defaultImplementationModel)
+	}
+}
+
+// TestDispatchWithNonce_Rebase verifies that DispatchWithNonce threads the
+// externally-provided nonce and kind="rebase" through both the broker register
+// call and the stream job — DispatchRebase (conflict.go) relies on the nonce
+// it passes here matching exactly what SetResolving already persisted to the DB,
+// since the executor's /callback validates against that persisted nonce.
+func TestDispatchWithNonce_Rebase(t *testing.T) {
+	var capturedKind, capturedNonce string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/register" {
+			var body brokerRegisterRequest
+			body2, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(body2, &body)
+			capturedKind = body.Metadata.Kind
+			capturedNonce = body.Nonce
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ms := &mockStreamer{}
+	d := newTestDispatcher(srv.URL, ms, srv.Client())
+	cfg := newTestConfig(srv.URL)
+	task := newTestTask()
+
+	if err := d.DispatchWithNonce(context.Background(), cfg, task, "rebase-handle", "rebase-nonce", "rebase"); err != nil {
+		t.Fatalf("DispatchWithNonce returned error: %v", err)
+	}
+
+	if capturedKind != "rebase" {
+		t.Errorf("metadata.kind = %q, want rebase", capturedKind)
+	}
+	if capturedNonce != "rebase-nonce" {
+		t.Errorf("register nonce = %q, want rebase-nonce", capturedNonce)
+	}
+
+	if len(ms.calls) != 1 {
+		t.Fatalf("StreamAdd called %d times, want 1", len(ms.calls))
+	}
+	var job dispatchJob
+	if err := json.Unmarshal([]byte(ms.calls[0].values["job"]), &job); err != nil {
+		t.Fatalf("unmarshal job: %v", err)
+	}
+	if job.Kind != "rebase" {
+		t.Errorf("job.Kind = %q, want rebase", job.Kind)
+	}
+	if job.Nonce != "rebase-nonce" {
+		t.Errorf("job.Nonce = %q, want rebase-nonce", job.Nonce)
 	}
 }

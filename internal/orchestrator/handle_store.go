@@ -7,11 +7,16 @@ import (
 )
 
 // HandleEntry records the DB identifiers for a dispatched task handle.
+// When HandoffPRID is non-nil, this entry tracks a handoff-PR rebase dispatch
+// and TaskUUID is not used. When HandoffPRID is nil, it is a task dispatch.
 type HandleEntry struct {
 	FeatureUUID uuid.UUID
 	TaskUUID    uuid.UUID
 	FeatureName string
 	TaskName    string
+	// HandoffPRID is set for handoff-PR rebase dispatches. When non-nil, the
+	// entry belongs to the handoff-PR rebase loop, not the task dispatch loop.
+	HandoffPRID *uuid.UUID
 }
 
 // HandleStore is an in-process, thread-safe map from handle string to HandleEntry.

@@ -110,35 +110,46 @@ func NewDispatcher(brokerURL string, stream Streamer, httpClient *http.Client, q
 // Dispatch registers the handle with the broker and enqueues the DispatchJob.
 // A single-use nonce is generated here and threaded through both the /register
 // call and the stream entry so the executor's /callback validates correctly.
+// Uses broker kind "impl" (implementation task).
 func (d *Dispatcher) Dispatch(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error {
-	nonce := uuid.New().String()
+	return d.DispatchWithNonce(ctx, cfg, task, handle, uuid.New().String(), "impl")
+}
+
+// DispatchWithNonce registers the handle with the broker and enqueues a
+// DispatchJob using an externally-provided nonce and kind (e.g. "impl", "review",
+// "rebase"). Use this when the nonce must be persisted to the DB before dispatch
+// (e.g. reviewer/fix/rebase claims where SetReviewing/ClaimFix/SetResolving
+// atomically store handle+nonce) — the executor's /callback validates the nonce
+// it receives against the one persisted in the DB, so they must match exactly.
+func (d *Dispatcher) DispatchWithNonce(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle, nonce, kind string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	if err := d.registerHandle(ctx, handle, task, cfg.OrganizationID, nonce, now); err != nil {
-		return fmt.Errorf("dispatch: broker register: %w", err)
+	if err := d.registerHandleWithKind(ctx, handle, task, cfg.OrganizationID, nonce, now, kind); err != nil {
+		return fmt.Errorf("dispatch(%s): broker register: %w", kind, err)
 	}
 
-	if err := d.enqueueJob(ctx, cfg, task, handle, nonce, now); err != nil {
-		return fmt.Errorf("dispatch: enqueue job: %w", err)
+	if err := d.enqueueJobWithKind(ctx, cfg, task, handle, nonce, now, kind); err != nil {
+		return fmt.Errorf("dispatch(%s): enqueue job: %w", kind, err)
 	}
 
 	return nil
 }
 
-func (d *Dispatcher) registerHandle(
+func (d *Dispatcher) registerHandleWithKind(
 	ctx context.Context,
 	handle string,
 	task db.WorkspaceTask,
 	tenantID string,
 	nonce string,
 	startedAt string,
+	kind string,
 ) error {
 	body := brokerRegisterRequest{
 		Handle: handle,
 		Nonce:  nonce,
 		Owner:  "go",
 		Metadata: handleMetadata{
-			Kind:      "impl",
+			Kind:      kind,
 			FeatureID: task.FeatureName,
 			TaskID:    task.TaskName,
 			TenantID:  tenantID,
@@ -175,7 +186,7 @@ func (d *Dispatcher) registerHandle(
 	return nil
 }
 
-func (d *Dispatcher) enqueueJob(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle, nonce, now string) error {
+func (d *Dispatcher) enqueueJobWithKind(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle, nonce, now, kind string) error {
 	branch := ResolveTaskBranch(task)
 	repoURL, err := d.getRepoURL(ctx, cfg, task)
 	if err != nil {
@@ -185,7 +196,7 @@ func (d *Dispatcher) enqueueJob(ctx context.Context, cfg *config.Config, task db
 	job := dispatchJob{
 		Handle:              handle,
 		Nonce:               nonce,
-		Kind:                "impl",
+		Kind:                kind,
 		TaskID:              task.TaskName,
 		FeatureID:           task.FeatureName,
 		WorkspaceID:         cfg.WorkspaceID,
@@ -232,6 +243,65 @@ func (d *Dispatcher) getRepoURL(
 	}
 
 	return *repo.RepoURL, nil
+}
+
+// EnqueueExisting re-sends an existing dispatch job to the Redis stream using
+// the provided handle, nonce, and kind. It does NOT re-register with the broker
+// — the broker already holds the handle from the original Dispatch call.
+//
+// This is the reconciler path: after a crash the task still has its original
+// dispatch_handle/nonce in the DB; EnqueueExisting replays the stream entry so
+// the executor picks it up again. On Redis failure the error is returned to the
+// caller (reconciler logs and skips — no task block).
+func (d *Dispatcher) EnqueueExisting(
+	ctx context.Context,
+	cfg *config.Config,
+	task db.WorkspaceTask,
+	handle, nonce, kind string,
+) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	branch := ResolveTaskBranch(task)
+	repoURL, err := d.getRepoURL(ctx, cfg, task)
+	if err != nil {
+		return fmt.Errorf("EnqueueExisting: get repo URL: %w", err)
+	}
+
+	job := dispatchJob{
+		Handle:             handle,
+		Nonce:              nonce,
+		Kind:               kind,
+		TaskID:             task.TaskName,
+		FeatureID:          task.FeatureName,
+		WorkspaceID:        cfg.WorkspaceID,
+		TaskRepoURL:        repoURL,
+		TaskRepoBranch:     branch,
+		TaskBaseBranch:     FeatureBranchName(task.FeatureName),
+		TaskRepoBaseBranch: cfg.BaseBranch,
+		MgmtRepoURL:        cfg.ManagementRepo,
+		CallbackURL:        cfg.BrokerURL + "/callback",
+		EnqueuedAt:         now,
+	}
+
+	payload, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("EnqueueExisting: marshal: %w", err)
+	}
+
+	return d.stream.StreamAdd(ctx, "platform:dispatch", map[string]string{
+		"job": string(payload),
+	})
+}
+
+// enqueueHandoffJob enqueues a pre-built dispatchJob to the Redis dispatch stream.
+// Used by DispatchHandoffPRRebase which constructs the job directly.
+func (d *Dispatcher) enqueueHandoffJob(ctx context.Context, job dispatchJob) error {
+	payload, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("enqueueHandoffJob: marshal: %w", err)
+	}
+	return d.stream.StreamAdd(ctx, "platform:dispatch", map[string]string{
+		"job": string(payload),
+	})
 }
 
 func (d *Dispatcher) getModelID(ctx context.Context, workspaceID string) string {

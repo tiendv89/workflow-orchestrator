@@ -1,5 +1,7 @@
 // Package main implements the Go orchestrator binary. It runs a continuous
-// poll cycle: find eligible tasks → claim → dispatch → reap → merge-poll → sleep.
+// poll cycle: feature/handoff triggers → handoff-PR rebase+finalize (HIGH) →
+// task dispatch (claim/fix/reviewer/task-rebase) with leftover headroom →
+// reap → reconciler → sleep.
 package main
 
 import (
@@ -86,13 +88,52 @@ func main() {
 		dispatch: func(ctx context.Context, c *config.Config, task db.WorkspaceTask, handle string) error {
 			return dispatcher.Dispatch(ctx, c, task, handle)
 		},
+		findReviewable: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error) {
+			return orchestrator.FindReviewableTasks(ctx, pool, wsID)
+		},
+		dispatchReviewer: func(ctx context.Context, pool *pgxpool.Pool, c *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error) {
+			return orchestrator.DispatchReviewer(ctx, pool, c, wsID, task, dispatcher, hs, ghClient)
+		},
+		findFixable: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error) {
+			return orchestrator.FindFixableTasks(ctx, pool, wsID)
+		},
+		dispatchFix: func(ctx context.Context, pool *pgxpool.Pool, c *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error) {
+			return orchestrator.DispatchFix(ctx, pool, c, wsID, task, dispatcher, hs)
+		},
 		reapCompleted: func(ctx context.Context, c *config.Config, pool *pgxpool.Pool, hs *orchestrator.HandleStore) error {
 			return orchestrator.ReapCompleted(ctx, c, pool, hs)
+		},
+		reconcileStuck: func(ctx context.Context, c *config.Config, pool *pgxpool.Pool) error {
+			return orchestrator.ReconcileStuckDispatches(ctx, c, pool, dispatcher, ghClient)
 		},
 		pollMergedPRs: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error {
 			return orchestrator.PollMergedPRs(ctx, ghClient, pool, wsID)
 		},
+		findConflicted: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error) {
+			return orchestrator.FindConflictedTasks(ctx, pool, wsID)
+		},
+		dispatchConflicted: func(ctx context.Context, pool *pgxpool.Pool, c *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error) {
+			return orchestrator.DispatchRebase(ctx, c, pool, hs, dispatcher, task)
+		},
 		newHandle: uuid.New,
+		runFeatureLifecycle: func(ctx context.Context, pool *pgxpool.Pool, c *config.Config, wsID uuid.UUID) error {
+			return orchestrator.RunFeatureLifecycle(ctx, pool, c, ghClient, wsID)
+		},
+		pollHandoffPRs: func(ctx context.Context, pool *pgxpool.Pool) error {
+			return orchestrator.PollHandoffPRs(ctx, ghClient, pool)
+		},
+		findConflictedHandoffPRs: func(ctx context.Context, pool *pgxpool.Pool, maxRebaseAttempts int) ([]db.HandoffPr, error) {
+			return orchestrator.FindConflictedHandoffPRs(ctx, pool, maxRebaseAttempts)
+		},
+		dispatchHandoffPRRebase: func(ctx context.Context, pool *pgxpool.Pool, c *config.Config, wsID uuid.UUID, pr db.HandoffPr, hs *orchestrator.HandleStore) (bool, error) {
+			return orchestrator.DispatchHandoffPRRebase(ctx, c, pool, hs, dispatcher, wsID, pr)
+		},
+		checkAndFinalizeHandoffs: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error {
+			return orchestrator.CheckAndFinalizeHandoffs(ctx, pool, ghClient, wsID)
+		},
+		countInFlight: func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) (int, error) {
+			return orchestrator.CountInFlight(ctx, pool, wsID)
+		},
 	}
 
 	ps := newPollState(cfg.PollIntervalSeconds)
@@ -147,18 +188,45 @@ func (s *pollState) next(hadError bool) time.Duration {
 // loopConfig holds injectable functions for each step of the poll cycle.
 // Production code wires real implementations; tests inject stubs.
 type loopConfig struct {
-	findEligible  func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
-	claimTask     func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, featureName, taskName, executor string) (bool, error)
-	rollbackClaim func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID) (bool, error)
-	dispatch      func(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error
-	reapCompleted func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, hs *orchestrator.HandleStore) error
-	pollMergedPRs func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error
-	newHandle     func() uuid.UUID
+	findEligible       func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
+	claimTask          func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, featureName, taskName, executor string) (bool, error)
+	rollbackClaim      func(ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID) (bool, error)
+	dispatch           func(ctx context.Context, cfg *config.Config, task db.WorkspaceTask, handle string) error
+	findReviewable     func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
+	dispatchReviewer   func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error)
+	findFixable        func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
+	dispatchFix        func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error)
+	reapCompleted      func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, hs *orchestrator.HandleStore) error
+	reconcileStuck     func(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool) error
+	pollMergedPRs      func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error
+	findConflicted     func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) ([]db.WorkspaceTask, error)
+	dispatchConflicted func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, task db.WorkspaceTask, hs *orchestrator.HandleStore) (bool, error)
+	newHandle          func() uuid.UUID
+	// Feature lifecycle + handoff (HIGH priority, run before task dispatch).
+	runFeatureLifecycle      func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID) error
+	pollHandoffPRs           func(ctx context.Context, pool *pgxpool.Pool) error
+	findConflictedHandoffPRs func(ctx context.Context, pool *pgxpool.Pool, maxRebaseAttempts int) ([]db.HandoffPr, error)
+	dispatchHandoffPRRebase  func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, wsID uuid.UUID, pr db.HandoffPr, hs *orchestrator.HandleStore) (bool, error)
+	checkAndFinalizeHandoffs func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) error
+	// Soft-claim throttle. When non-nil, called once per cycle before dispatch
+	// steps to derive the current in-flight count. When nil the throttle is
+	// disabled (all headroom available).
+	countInFlight func(ctx context.Context, pool *pgxpool.Pool, wsID uuid.UUID) (int, error)
 }
 
 // runCycle executes one full poll iteration. Each step's errors are logged and
 // do not crash the loop — the next cycle will retry. Returns true if any step
 // encountered an error (used by the caller to drive backoff).
+//
+// Cycle order (technical-design §"Cycle order"):
+//
+//	feature/handoff triggers (HIGH priority, no headroom consumed)
+//	→ handoff-PR conflict-rebase + finalize (HIGH priority, uses headroom)
+//	→ task dispatch — claim/fix/reviewer (leftover headroom)
+//	→ poll merged PRs (always — merged-is-truth invariant)
+//	→ task-rebase dispatch (leftover headroom)
+//	→ reap
+//	→ reconciler
 func runCycle(
 	ctx context.Context,
 	cfg *config.Config,
@@ -171,60 +239,274 @@ func runCycle(
 	log.Debug().Msg("poll cycle start")
 	hadError := false
 
-	// Step a: find eligible tasks and claim + dispatch each.
-	tasks, err := lc.findEligible(ctx, pool, workspaceID)
-	if err != nil {
-		log.Error().Err(err).Msg("poll: FindEligibleTasks")
-		hadError = true
-	} else {
-		for _, task := range tasks {
-			handle := lc.newHandle().String()
+	// ── HIGH PRIORITY: feature lifecycle + handoff polling ────────────────────
+	// These run first, unconditionally, before the headroom check. They do not
+	// dispatch new executors themselves (no headroom consumed here).
 
-			won, claimErr := lc.claimTask(ctx, pool, workspaceID, task.TaskID, task.FeatureName, task.TaskName, executorID)
-			if claimErr != nil {
-				log.Error().Err(claimErr).Str("task", task.TaskName).Msg("poll: ClaimTask error")
-				hadError = true
-				continue
-			}
-			if !won {
-				log.Debug().Str("task", task.TaskName).Msg("poll: claim lost — another instance won")
-				continue
-			}
-
-			if dispatchErr := lc.dispatch(ctx, cfg, task, handle); dispatchErr != nil {
-				log.Error().Err(dispatchErr).Str("task", task.TaskName).Msg("poll: Dispatch error — rolling back claim")
-				hadError = true
-				if _, rbErr := lc.rollbackClaim(ctx, pool, workspaceID, task.TaskID); rbErr != nil {
-					log.Error().Err(rbErr).Str("task", task.TaskName).Msg("poll: RollbackClaim error — task may be stuck in in_progress")
-				}
-				continue
-			}
-
-			hs.Register(handle, orchestrator.HandleEntry{
-				FeatureUUID: task.FeatureID,
-				TaskUUID:    task.TaskID,
-				FeatureName: task.FeatureName,
-				TaskName:    task.TaskName,
-			})
-
-			log.Info().
-				Str("handle", handle).
-				Str("task", task.TaskName).
-				Str("feature", task.FeatureName).
-				Msg("poll: task dispatched")
+	// Step 0a: feature lifecycle — in_implementation, handoff trigger.
+	if lc.runFeatureLifecycle != nil {
+		if err := lc.runFeatureLifecycle(ctx, pool, cfg, workspaceID); err != nil {
+			log.Error().Err(err).Msg("poll: RunFeatureLifecycle error")
+			hadError = true
 		}
 	}
 
-	// Step b: reap completed tasks from the broker.
-	if err := lc.reapCompleted(ctx, cfg, pool, hs); err != nil {
-		log.Error().Err(err).Msg("poll: ReapCompleted error")
-		hadError = true
+	// Step 0b: poll handoff PRs for merge/conflict status.
+	if lc.pollHandoffPRs != nil {
+		if err := lc.pollHandoffPRs(ctx, pool); err != nil {
+			log.Error().Err(err).Msg("poll: PollHandoffPRs error")
+			hadError = true
+		}
 	}
 
-	// Step c: poll GitHub for merged PRs.
-	if err := lc.pollMergedPRs(ctx, pool, workspaceID); err != nil {
-		log.Error().Err(err).Msg("poll: PollMergedPRs error")
-		hadError = true
+	// ── SOFT-CLAIM THROTTLE: compute headroom once before all dispatch steps ──
+	// headroom = MAX_INFLIGHT − inflight. All dispatch kinds below share this
+	// budget. When countInFlight is nil (e.g. tests that don't wire it),
+	// headroom is treated as unlimited (max-int).
+	headroom := int(^uint(0) >> 1) // max int — unlimited when throttle not wired
+	if lc.countInFlight != nil {
+		inflight, inflightErr := lc.countInFlight(ctx, pool, workspaceID)
+		if inflightErr != nil {
+			log.Error().Err(inflightErr).Msg("poll: CountInFlight error — skipping dispatch this cycle")
+			hadError = true
+			// Treat as exhausted so all dispatch steps (including task-rebase in
+			// postDispatch) are gated out via the headroom <= 0 check.
+			headroom = 0
+			goto postDispatch
+		}
+		headroom = orchestrator.Headroom(cfg.MaxInFlight, inflight)
+		log.Debug().Int("inflight", inflight).Int("headroom", headroom).Int("max_inflight", cfg.MaxInFlight).Msg("poll: soft-claim throttle")
+		if headroom == 0 {
+			log.Info().Int("inflight", inflight).Msg("poll: headroom exhausted — skipping dispatch this cycle")
+			goto postDispatch
+		}
+	}
+
+	// ── HIGH PRIORITY DISPATCHES: handoff-PR rebase + finalize ───────────────
+	// These consume headroom before task dispatch ("leftover headroom").
+
+	// Step 0c: dispatch handoff-PR rebases for conflicted handoff PRs (HIGH priority).
+	if lc.findConflictedHandoffPRs != nil && lc.dispatchHandoffPRRebase != nil {
+		conflictedHPRs, err := lc.findConflictedHandoffPRs(ctx, pool, cfg.MaxRebaseAttempts)
+		if err != nil {
+			log.Error().Err(err).Msg("poll: FindConflictedHandoffPRs error")
+			hadError = true
+		} else {
+			for _, pr := range conflictedHPRs {
+				if headroom <= 0 {
+					log.Debug().Str("repo", pr.Repo).Msg("poll: handoff-PR rebase skipped — headroom exhausted")
+					break
+				}
+				won, rebaseErr := lc.dispatchHandoffPRRebase(ctx, pool, cfg, workspaceID, pr, hs)
+				if rebaseErr != nil {
+					log.Error().Err(rebaseErr).Str("repo", pr.Repo).Msg("poll: DispatchHandoffPRRebase error")
+					hadError = true
+					continue
+				}
+				if !won {
+					log.Debug().Str("repo", pr.Repo).Msg("poll: handoff-PR rebase claim lost")
+					continue
+				}
+				headroom--
+				log.Info().Str("repo", pr.Repo).Int("headroom_remaining", headroom).Msg("poll: handoff-PR rebase dispatched")
+			}
+		}
+	}
+
+	// Step 0d: finalize handoffs where all handoff PRs are merged (HIGH priority, no dispatch).
+	if lc.checkAndFinalizeHandoffs != nil {
+		if err := lc.checkAndFinalizeHandoffs(ctx, pool, workspaceID); err != nil {
+			log.Error().Err(err).Msg("poll: CheckAndFinalizeHandoffs error")
+			hadError = true
+		}
+	}
+
+	// ── TASK DISPATCH: claim/fix/reviewer/task-rebase (leftover headroom) ────
+
+	// Step a: find eligible tasks and claim + dispatch each.
+	{
+		tasks, err := lc.findEligible(ctx, pool, workspaceID)
+		if err != nil {
+			log.Error().Err(err).Msg("poll: FindEligibleTasks")
+			hadError = true
+		} else {
+			for _, task := range tasks {
+				if headroom <= 0 {
+					log.Debug().Str("task", task.TaskName).Msg("poll: task claim skipped — headroom exhausted")
+					break
+				}
+				handle := lc.newHandle().String()
+
+				won, claimErr := lc.claimTask(ctx, pool, workspaceID, task.TaskID, task.FeatureName, task.TaskName, executorID)
+				if claimErr != nil {
+					log.Error().Err(claimErr).Str("task", task.TaskName).Msg("poll: ClaimTask error")
+					hadError = true
+					continue
+				}
+				if !won {
+					log.Debug().Str("task", task.TaskName).Msg("poll: claim lost — another instance won")
+					continue
+				}
+
+				if dispatchErr := lc.dispatch(ctx, cfg, task, handle); dispatchErr != nil {
+					log.Error().Err(dispatchErr).Str("task", task.TaskName).Msg("poll: Dispatch error — rolling back claim")
+					hadError = true
+					if _, rbErr := lc.rollbackClaim(ctx, pool, workspaceID, task.TaskID); rbErr != nil {
+						log.Error().Err(rbErr).Str("task", task.TaskName).Msg("poll: RollbackClaim error — task may be stuck in in_progress")
+					}
+					continue
+				}
+
+				headroom--
+				hs.Register(handle, orchestrator.HandleEntry{
+					FeatureUUID: task.FeatureID,
+					TaskUUID:    task.TaskID,
+					FeatureName: task.FeatureName,
+					TaskName:    task.TaskName,
+				})
+
+				log.Info().
+					Str("handle", handle).
+					Str("task", task.TaskName).
+					Str("feature", task.FeatureName).
+					Int("headroom_remaining", headroom).
+					Msg("poll: task dispatched")
+			}
+		}
+	}
+
+	// Step b: find reviewable tasks and dispatch a reviewer for each.
+	// findReviewable/dispatchReviewer and findFixable/dispatchFix are nil-guarded
+	// like reconcileStuck below — existing callers that don't wire the reviewer
+	// cluster still work.
+	if lc.findReviewable != nil && lc.dispatchReviewer != nil {
+		reviewable, err := lc.findReviewable(ctx, pool, workspaceID)
+		if err != nil {
+			log.Error().Err(err).Msg("poll: FindReviewableTasks")
+			hadError = true
+		} else {
+			for _, task := range reviewable {
+				if headroom <= 0 {
+					log.Debug().Str("task", task.TaskName).Msg("poll: reviewer skipped — headroom exhausted")
+					break
+				}
+				won, reviewErr := lc.dispatchReviewer(ctx, pool, cfg, workspaceID, task, hs)
+				if reviewErr != nil {
+					log.Error().Err(reviewErr).Str("task", task.TaskName).Msg("poll: DispatchReviewer error")
+					hadError = true
+					continue
+				}
+				if !won {
+					log.Debug().Str("task", task.TaskName).Msg("poll: reviewer claim lost — another instance won")
+					continue
+				}
+				headroom--
+				log.Info().
+					Str("task", task.TaskName).
+					Str("feature", task.FeatureName).
+					Int("headroom_remaining", headroom).
+					Msg("poll: reviewer dispatched")
+			}
+		}
+	}
+
+	// Step c: find change_requested tasks and dispatch a fix agent for each.
+	if lc.findFixable != nil && lc.dispatchFix != nil {
+		fixable, err := lc.findFixable(ctx, pool, workspaceID)
+		if err != nil {
+			log.Error().Err(err).Msg("poll: FindFixableTasks")
+			hadError = true
+		} else {
+			for _, task := range fixable {
+				if headroom <= 0 {
+					log.Debug().Str("task", task.TaskName).Msg("poll: fix dispatch skipped — headroom exhausted")
+					break
+				}
+				won, fixErr := lc.dispatchFix(ctx, pool, cfg, workspaceID, task, hs)
+				if fixErr != nil {
+					log.Error().Err(fixErr).Str("task", task.TaskName).Msg("poll: DispatchFix error")
+					hadError = true
+					continue
+				}
+				if !won {
+					log.Debug().Str("task", task.TaskName).Msg("poll: fix claim lost — another instance won")
+					continue
+				}
+				headroom--
+				log.Info().
+					Str("task", task.TaskName).
+					Str("feature", task.FeatureName).
+					Int("headroom_remaining", headroom).
+					Msg("poll: fix agent dispatched")
+			}
+		}
+	}
+
+postDispatch:
+	// ── POST-DISPATCH: always runs regardless of headroom state ───────────────
+
+	// Step d: poll GitHub for merged PRs (ground truth for done transitions + conflict detection).
+	// Must always run — even when headroom = 0 — because the reconciler explicitly defers to
+	// PollMergedPRs for reviewing tasks with merged PRs. Skipping it when headroom is
+	// exhausted would create a permanent deadlock: all reviewing slots occupied by tasks
+	// with merged PRs, those tasks never transitioned to done, and no headroom ever freed.
+	// Trade-off: task-rebase below is still headroom-gated, so tasks newly detected as
+	// conflicted here are dispatched on the next cycle when headroom allows.
+	if lc.pollMergedPRs != nil {
+		if err := lc.pollMergedPRs(ctx, pool, workspaceID); err != nil {
+			log.Error().Err(err).Msg("poll: PollMergedPRs error")
+			hadError = true
+		}
+	}
+
+	// Step e: find conflicted tasks and dispatch a rebase agent for each (leftover headroom).
+	// Runs after Step d so tasks set to 'conflicted' by pollMergedPRs this cycle
+	// can be dispatched immediately when headroom allows.
+	if lc.findConflicted != nil && lc.dispatchConflicted != nil {
+		conflicted, err := lc.findConflicted(ctx, pool, workspaceID)
+		if err != nil {
+			log.Error().Err(err).Msg("poll: FindConflictedTasks")
+			hadError = true
+		} else {
+			for _, task := range conflicted {
+				if headroom <= 0 {
+					log.Debug().Str("task", task.TaskName).Msg("poll: task rebase skipped — headroom exhausted")
+					break
+				}
+				won, rebaseErr := lc.dispatchConflicted(ctx, pool, cfg, workspaceID, task, hs)
+				if rebaseErr != nil {
+					log.Error().Err(rebaseErr).Str("task", task.TaskName).Msg("poll: DispatchRebase error")
+					hadError = true
+					continue
+				}
+				if !won {
+					log.Debug().Str("task", task.TaskName).Msg("poll: rebase claim lost — another instance won")
+					continue
+				}
+				headroom--
+				log.Info().
+					Str("task", task.TaskName).
+					Str("feature", task.FeatureName).
+					Int("headroom_remaining", headroom).
+					Msg("poll: rebase dispatched")
+			}
+		}
+	}
+
+	// Step f: reap completed tasks from the broker.
+	if lc.reapCompleted != nil {
+		if err := lc.reapCompleted(ctx, cfg, pool, hs); err != nil {
+			log.Error().Err(err).Msg("poll: ReapCompleted error")
+			hadError = true
+		}
+	}
+
+	// Step g: reconcile stuck dispatches (crash/timeout recovery).
+	if lc.reconcileStuck != nil {
+		if err := lc.reconcileStuck(ctx, cfg, pool); err != nil {
+			log.Error().Err(err).Msg("poll: ReconcileStuck error")
+			hadError = true
+		}
 	}
 
 	log.Debug().Msg("poll cycle complete")

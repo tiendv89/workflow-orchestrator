@@ -426,6 +426,72 @@ func (m *mockGitHubClient) GetPR(_ context.Context, _ string) (*gh.PRStatus, err
 	return &gh.PRStatus{Merged: m.merged, State: "closed"}, nil
 }
 
+// mockFullGitHubClient implements PRGetter + PRCreator + PRMerger for tests that
+// exercise the full autonomous path (reviewer dispatch + handoff + finalize).
+//
+// GetPR returns taskMerged for the task PR URL; handoffMerged for all other URLs.
+// CreatePR returns sequential mock URLs. BranchExists always returns true.
+// MergePR is a no-op (simulates successful mgmt PR merge).
+type mockFullGitHubClient struct {
+	mu            sync.Mutex
+	taskPRURL     string   // the impl task's PR URL (set before GetPR calls)
+	taskMerged    bool     // controls GetPR response for task PR
+	handoffMerged bool     // controls GetPR response for handoff PRs
+	createdPRURLs []string // URLs returned by CreatePR (for assertion)
+}
+
+func (m *mockFullGitHubClient) setTaskMerged(v bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.taskMerged = v
+}
+
+func (m *mockFullGitHubClient) setHandoffMerged(v bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.handoffMerged = v
+}
+
+func (m *mockFullGitHubClient) GetPR(_ context.Context, prURL string) (*gh.PRStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if prURL == m.taskPRURL {
+		return &gh.PRStatus{Merged: m.taskMerged, State: "closed"}, nil
+	}
+	return &gh.PRStatus{Merged: m.handoffMerged, State: "closed"}, nil
+}
+
+func (m *mockFullGitHubClient) BranchExists(_ context.Context, _, _ string) (bool, error) {
+	return true, nil
+}
+
+func (m *mockFullGitHubClient) CreatePR(_ context.Context, _, _, _, _, _ string, _ bool) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	url := fmt.Sprintf("https://github.com/owner/repo/pull/%d", 2000+len(m.createdPRURLs))
+	m.createdPRURLs = append(m.createdPRURLs, url)
+	return url, nil
+}
+
+func (m *mockFullGitHubClient) MergePR(_ context.Context, _ string) error {
+	return nil
+}
+
+// getHandlesExcept returns all handles recorded in the broker's register log
+// except those in the exclude set. Used to find the reviewer handle after
+// DispatchReviewer registers it.
+func (b *faithfulBroker) getHandlesExcept(exclude map[string]struct{}) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []string
+	for _, rb := range b.registerBodies {
+		if _, skip := exclude[rb.Handle]; !skip {
+			out = append(out, rb.Handle)
+		}
+	}
+	return out
+}
+
 // ─── mock Redis streamer ──────────────────────────────────────────────────────
 
 type mockStreamer struct{}
@@ -675,6 +741,76 @@ func runOneCycle(
 	}
 
 	return claimedHandles, nil
+}
+
+// ─── unblock chain helpers ───────────────────────────────────────────────────
+
+// simulateUnblockAPI applies the same logic as the workflow-backend
+// POST .../unblock endpoint directly against the database — used in E2E tests
+// where the backend service is not running.
+//
+// Derives the resume status from blocked_from_status (in_progress → ready;
+// reviewing / in_review → in_review), resets the causing counter, and clears
+// the blocked columns.  Matches the server-side logic in technical-design §"API design".
+func simulateUnblockAPI(t *testing.T, ctx context.Context, pool *pgxpool.Pool, wsID, taskID uuid.UUID, blockedReason string) {
+	t.Helper()
+
+	var blockedFromStatus *string
+	err := pool.QueryRow(ctx,
+		`SELECT blocked_from_status FROM workspace_tasks
+		 WHERE workspace_id=$1 AND task_id=$2 AND status='blocked'`,
+		wsID, taskID,
+	).Scan(&blockedFromStatus)
+	if err != nil {
+		t.Fatalf("simulateUnblockAPI: read blocked_from_status: %v", err)
+	}
+
+	targetStatus := "ready"
+	if blockedFromStatus != nil {
+		switch *blockedFromStatus {
+		case "reviewing", "in_review":
+			targetStatus = "in_review"
+		}
+	}
+
+	_, err = pool.Exec(ctx,
+		`UPDATE workspace_tasks SET
+		     status              = $1,
+		     blocked_reason      = NULL,
+		     blocked_details     = NULL,
+		     blocked_from_status = NULL,
+		     updated_at          = now()
+		 WHERE workspace_id = $2 AND task_id = $3 AND status = 'blocked'`,
+		targetStatus, wsID, taskID,
+	)
+	if err != nil {
+		t.Fatalf("simulateUnblockAPI: apply transition: %v", err)
+	}
+
+	// Reset the causing counter keyed on blocked_reason (technical-design §4).
+	switch blockedReason {
+	case "review_incomplete_exceeded":
+		_, err = pool.Exec(ctx,
+			`UPDATE workspace_tasks SET review_incomplete_count=0, updated_at=now()
+			 WHERE workspace_id=$1 AND task_id=$2`,
+			wsID, taskID,
+		)
+	case "max_turns_exceeded":
+		_, err = pool.Exec(ctx,
+			`UPDATE workspace_tasks SET max_turns_retry_count=0, updated_at=now()
+			 WHERE workspace_id=$1 AND task_id=$2`,
+			wsID, taskID,
+		)
+	case "rebase_failed":
+		_, err = pool.Exec(ctx,
+			`UPDATE workspace_tasks SET rebase_attempts=0, conflict_state='none', updated_at=now()
+			 WHERE workspace_id=$1 AND task_id=$2`,
+			wsID, taskID,
+		)
+	}
+	if err != nil {
+		t.Fatalf("simulateUnblockAPI: reset counter (%s): %v", blockedReason, err)
+	}
 }
 
 // ─── E2E test ──────────────────────────────────────────────────────────────────
@@ -935,4 +1071,450 @@ func TestCoexistence(t *testing.T) {
 		t.Error("A4 FAIL: go task was deleted by sync cycle")
 	}
 	t.Log("A4 PASS: go feature and tasks survived sync cycle")
+}
+
+// ─── feature/handoff DB helpers ───────────────────────────────────────────────
+
+func getFeatureStatus(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	wsID, featureID uuid.UUID,
+) string {
+	t.Helper()
+	var status *string
+	err := pool.QueryRow(ctx,
+		`SELECT feature_status FROM workspace_features WHERE workspace_id=$1 AND feature_id=$2`,
+		wsID, featureID,
+	).Scan(&status)
+	if err != nil {
+		t.Fatalf("getFeatureStatus: %v", err)
+	}
+	if status == nil {
+		return ""
+	}
+	return *status
+}
+
+func countHandoffPRs(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	featureID uuid.UUID,
+) int {
+	t.Helper()
+	var count int
+	err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM handoff_prs hp
+		 JOIN handoffs h ON h.id = hp.handoff_id
+		 WHERE h.feature_id = $1`,
+		featureID,
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("countHandoffPRs: %v", err)
+	}
+	return count
+}
+
+// TestFullAutonomousPath verifies the complete autonomous execution path:
+//
+//  1. claim → in_progress (feature: ready_for_implementation → in_implementation)
+//  2. executor callback in_review → reap → in_review
+//  3. reviewer dispatch → reviewing → reviewer callback review_passed → reap → review_passed
+//  4. task PR merge → poll → done
+//  5. feature lifecycle → in_handoff (TriggerHandoff: handoff_prs rows created)
+//  6. PollHandoffPRs: mark handoff_prs.status = merged
+//  7. CheckAndFinalizeHandoffs → feature_status = done
+//
+// Runs in parallel with a legacy null-owner TS feature to assert owner isolation.
+// Covers T15 subtask 2 (autonomous path: reviewing → handoff → finalize) and
+// the technical-design §8 validation requirement.
+func TestFullAutonomousPath(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+
+	// ── setup ──────────────────────────────────────────────────────────────
+	wsID := seedWorkspace(t, ctx, pool)
+	t.Cleanup(func() {
+		// Delete handoffs first (cascade removes handoff_prs via ON DELETE CASCADE).
+		_, _ = pool.Exec(ctx,
+			`DELETE FROM handoffs WHERE feature_id IN
+			 (SELECT feature_id FROM workspace_features WHERE workspace_id=$1)`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspace_activity_events WHERE workspace_id=$1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspace_tasks            WHERE workspace_id=$1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspace_features         WHERE workspace_id=$1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspace_repos            WHERE workspace_id=$1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspaces                 WHERE id=$1`, wsID)
+	})
+	seedWorkspaceRepo(t, ctx, pool, wsID, "workflow-orchestrator", "git@github.com:owner/workflow-orchestrator.git")
+
+	// Seed go feature with one task.
+	goSpec := orchestrator.GoFeatureSpec{
+		WorkspaceID:    wsID,
+		OrganizationID: uuid.New(),
+		Slug:           "full-autonomous-" + uuid.New().String()[:8],
+		Title:          "Full Autonomous Path E2E",
+		Tasks: []orchestrator.GoTaskSpec{
+			{
+				Name:      "fa-T1",
+				Title:     "Full Autonomous Task",
+				Repo:      "workflow-orchestrator",
+				DependsOn: []string{},
+				ActorType: "agent",
+			},
+		},
+	}
+	if err := orchestrator.MaterializeFeature(ctx, pool, goSpec); err != nil {
+		t.Fatalf("MaterializeFeature: %v", err)
+	}
+
+	// Resolve feature + task IDs.
+	var goFeatureID, goTaskID uuid.UUID
+	err := pool.QueryRow(ctx,
+		`SELECT f.feature_id, t.task_id
+		 FROM workspace_features f
+		 JOIN workspace_tasks t USING (workspace_id, feature_id)
+		 WHERE f.workspace_id=$1 AND f.feature_name=$2`,
+		wsID, goSpec.Slug,
+	).Scan(&goFeatureID, &goTaskID)
+	if err != nil {
+		t.Fatalf("resolve go task: %v", err)
+	}
+
+	// Advance feature to ready_for_implementation — bypasses the human-approval
+	// step that precedes the autonomous execution window in production.
+	_, err = pool.Exec(ctx,
+		`UPDATE workspace_features SET feature_status='ready_for_implementation'
+		 WHERE workspace_id=$1 AND feature_id=$2`,
+		wsID, goFeatureID,
+	)
+	if err != nil {
+		t.Fatalf("set ready_for_implementation: %v", err)
+	}
+
+	// Seed legacy TS feature (null owner) for coexistence assertion.
+	tsFeatureID, tsTaskID := seedTSFeature(t, ctx, pool, wsID)
+	initialTSStatus := getTaskStatus(t, ctx, pool, wsID, tsTaskID)
+
+	// ── broker + mock GitHub ───────────────────────────────────────────────
+	broker := newFaithfulBroker()
+	brokerSrv := httptest.NewServer(broker)
+	t.Cleanup(brokerSrv.Close)
+
+	const taskPRURL = "https://github.com/owner/repo/pull/999"
+	ghMock := &mockFullGitHubClient{taskPRURL: taskPRURL}
+	streamer := &mockStreamer{}
+
+	cfg := buildCfg(wsID, brokerSrv.URL)
+	dispatcher := orchestrator.NewDispatcher(brokerSrv.URL, streamer, brokerSrv.Client(), queries.New(pool))
+	hs := orchestrator.NewHandleStore()
+	executorID := "go-orchestrator/e2e-full-autonomous"
+
+	// ── Cycle 1: claim → in_progress; feature lifecycle → in_implementation ─
+	t.Log("cycle 1: claim + dispatch")
+	claimed, err := runOneCycle(ctx, pool, wsID, cfg, dispatcher, hs, ghMock, executorID)
+	if err != nil {
+		t.Fatalf("cycle 1: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("cycle 1: expected 1 task claimed, got %d", len(claimed))
+	}
+	goHandle, ok := claimed[goTaskID]
+	if !ok {
+		t.Fatal("cycle 1: go task not in claimed set")
+	}
+	if status := getTaskStatus(t, ctx, pool, wsID, goTaskID); status != "in_progress" {
+		t.Fatalf("cycle 1: task status = %q, want in_progress", status)
+	}
+	// RunFeatureLifecycle: any task dispatched → ready_for_implementation → in_implementation.
+	if err := orchestrator.RunFeatureLifecycle(ctx, pool, cfg, ghMock, wsID); err != nil {
+		t.Fatalf("cycle 1: RunFeatureLifecycle: %v", err)
+	}
+	if fs := getFeatureStatus(t, ctx, pool, wsID, goFeatureID); fs != "in_implementation" {
+		t.Fatalf("cycle 1: feature_status = %q, want in_implementation", fs)
+	}
+	t.Log("cycle 1 PASS: task=in_progress, feature=in_implementation")
+
+	// ── Executor callback: terminal_status=in_review ──────────────────────
+	nonce, hasNonce := broker.getNonce(goHandle)
+	if !hasNonce {
+		t.Fatalf("executor callback: nonce not found for handle %q", goHandle)
+	}
+	postCallback(t, brokerSrv.URL, goHandle, nonce, "in_review", taskPRURL)
+	t.Logf("executor callback: in_review posted (handle=%s)", goHandle)
+
+	// ── Cycle 2: reap → in_review ─────────────────────────────────────────
+	t.Log("cycle 2: reap → in_review")
+	if _, err := runOneCycle(ctx, pool, wsID, cfg, dispatcher, hs, ghMock, executorID); err != nil {
+		t.Fatalf("cycle 2: %v", err)
+	}
+	if status := getTaskStatus(t, ctx, pool, wsID, goTaskID); status != "in_review" {
+		t.Fatalf("cycle 2: task status = %q, want in_review", status)
+	}
+	t.Log("cycle 2 PASS: task=in_review")
+
+	// ── Cycle 3: dispatch reviewer → reviewing ────────────────────────────
+	// Track all handles registered before reviewer dispatch.
+	preReviewHandles := make(map[string]struct{})
+	for _, entry := range broker.registeredOwners() {
+		preReviewHandles[entry.handle] = struct{}{}
+	}
+
+	t.Log("cycle 3: dispatch reviewer")
+	reviewableTasks, err := orchestrator.FindReviewableTasks(ctx, pool, wsID)
+	if err != nil {
+		t.Fatalf("cycle 3: FindReviewableTasks: %v", err)
+	}
+	if len(reviewableTasks) != 1 {
+		t.Fatalf("cycle 3: expected 1 reviewable task, got %d", len(reviewableTasks))
+	}
+	dispatched, err := orchestrator.DispatchReviewer(ctx, pool, cfg, wsID, reviewableTasks[0], dispatcher, hs, ghMock)
+	if err != nil {
+		t.Fatalf("cycle 3: DispatchReviewer: %v", err)
+	}
+	if !dispatched {
+		t.Fatal("cycle 3: DispatchReviewer returned false — reviewer not dispatched")
+	}
+	if status := getTaskStatus(t, ctx, pool, wsID, goTaskID); status != "reviewing" {
+		t.Fatalf("cycle 3: task status = %q, want reviewing", status)
+	}
+	t.Log("cycle 3 PASS: task=reviewing")
+
+	// ── Reviewer callback: terminal_status=review_passed (APPROVE) ─────────
+	newHandles := broker.getHandlesExcept(preReviewHandles)
+	if len(newHandles) != 1 {
+		t.Fatalf("reviewer callback: expected 1 new broker handle after DispatchReviewer, got %d", len(newHandles))
+	}
+	reviewerHandle := newHandles[0]
+	reviewerNonce, hasNonce := broker.getNonce(reviewerHandle)
+	if !hasNonce {
+		t.Fatalf("reviewer callback: nonce not found for reviewer handle %q", reviewerHandle)
+	}
+	postCallback(t, brokerSrv.URL, reviewerHandle, reviewerNonce, "review_passed", "")
+	t.Logf("reviewer callback: review_passed posted (handle=%s)", reviewerHandle)
+
+	// ── Cycle 4: reap reviewer → review_passed ────────────────────────────
+	t.Log("cycle 4: reap reviewer → review_passed")
+	if _, err := runOneCycle(ctx, pool, wsID, cfg, dispatcher, hs, ghMock, executorID); err != nil {
+		t.Fatalf("cycle 4: %v", err)
+	}
+	if status := getTaskStatus(t, ctx, pool, wsID, goTaskID); status != "review_passed" {
+		t.Fatalf("cycle 4: task status = %q, want review_passed", status)
+	}
+	t.Log("cycle 4 PASS: task=review_passed")
+
+	// ── Simulate task PR merge → cycle 5: poll → done ─────────────────────
+	ghMock.setTaskMerged(true)
+	t.Log("cycle 5: PR merge poll → done")
+	if _, err := runOneCycle(ctx, pool, wsID, cfg, dispatcher, hs, ghMock, executorID); err != nil {
+		t.Fatalf("cycle 5: %v", err)
+	}
+	if status := getTaskStatus(t, ctx, pool, wsID, goTaskID); status != "done" {
+		t.Fatalf("cycle 5: task status = %q, want done", status)
+	}
+	t.Log("cycle 5 PASS: task=done (PR merged)")
+
+	// ── Cycle 6: feature lifecycle → in_handoff (TriggerHandoff) ──────────
+	t.Log("cycle 6: feature lifecycle → in_handoff")
+	if err := orchestrator.RunFeatureLifecycle(ctx, pool, cfg, ghMock, wsID); err != nil {
+		t.Fatalf("cycle 6: RunFeatureLifecycle: %v", err)
+	}
+	if fs := getFeatureStatus(t, ctx, pool, wsID, goFeatureID); fs != "in_handoff" {
+		t.Fatalf("cycle 6: feature_status = %q, want in_handoff", fs)
+	}
+	handoffPRCount := countHandoffPRs(t, ctx, pool, goFeatureID)
+	if handoffPRCount == 0 {
+		t.Error("cycle 6: handoff_prs rows not created by TriggerHandoff")
+	}
+	t.Logf("cycle 6 PASS: feature=in_handoff, handoff_prs created (%d rows)", handoffPRCount)
+
+	// ── PollHandoffPRs: simulate handoff PR merges ─────────────────────────
+	ghMock.setHandoffMerged(true)
+	if err := orchestrator.PollHandoffPRs(ctx, ghMock, pool); err != nil {
+		t.Fatalf("PollHandoffPRs: %v", err)
+	}
+
+	// ── Cycle 7: finalize → feature_status = done ─────────────────────────
+	t.Log("cycle 7: CheckAndFinalizeHandoffs → feature done")
+	if err := orchestrator.CheckAndFinalizeHandoffs(ctx, pool, ghMock, wsID); err != nil {
+		t.Fatalf("cycle 7: CheckAndFinalizeHandoffs: %v", err)
+	}
+	if fs := getFeatureStatus(t, ctx, pool, wsID, goFeatureID); fs != "done" {
+		t.Fatalf("cycle 7: feature_status = %q, want done", fs)
+	}
+	t.Log("cycle 7 PASS: feature=done (handoff finalized)")
+
+	// ── Coexistence: TS feature must be unaffected ─────────────────────────
+	t.Log("assert coexistence: TS feature and task unaffected by go orchestrator")
+	if currentTSStatus := getTaskStatus(t, ctx, pool, wsID, tsTaskID); currentTSStatus != initialTSStatus {
+		t.Errorf("TS task status changed from %q to %q — go orchestrator must not touch TS tasks",
+			initialTSStatus, currentTSStatus)
+	}
+	var tsOwner *string
+	err = pool.QueryRow(ctx,
+		`SELECT owner FROM workspace_features WHERE workspace_id=$1 AND feature_id=$2`,
+		wsID, tsFeatureID,
+	).Scan(&tsOwner)
+	if err != nil {
+		t.Fatalf("query ts feature owner: %v", err)
+	}
+	if tsOwner != nil {
+		t.Errorf("TS feature owner changed from null to %q — owner partition violated", *tsOwner)
+	}
+	t.Log("coexistence PASS: TS feature and task unmodified")
+
+	t.Log("TestFullAutonomousPath PASS: claim→in_review→reviewing→review_passed→done; handoff→finalize→feature done")
+}
+
+// TestUnblockChain verifies the end-to-end unblock path in the go orchestrator:
+//
+//  1. A task is moved to blocked with a counter increment recorded
+//     (blocked_from_status="in_progress", blocked_reason="max_turns_exceeded",
+//     max_turns_retry_count=2).
+//  2. The workflow-backend unblock API is simulated by a direct DB mutation
+//     (same logic: derive target from blocked_from_status, reset counter, clear blocked columns).
+//  3. The orchestrator's claim loop picks up the unblocked task and transitions
+//     it to in_progress — proving the go orchestrator correctly observes the
+//     post-unblock state without any code change of its own.
+//  4. Counter reset is verified: max_turns_retry_count must be 0 after unblock.
+//
+// This covers the "Unblock chain: block a task → unblock API → resume; counter
+// reset verified" subtask from the T15 task spec.
+func TestUnblockChain(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+
+	// ── setup ──────────────────────────────────────────────────────────────
+	wsID := seedWorkspace(t, ctx, pool)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM workspace_activity_events WHERE workspace_id=$1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspace_tasks            WHERE workspace_id=$1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspace_features         WHERE workspace_id=$1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspace_repos            WHERE workspace_id=$1`, wsID)
+		_, _ = pool.Exec(ctx, `DELETE FROM workspaces                 WHERE id=$1`, wsID)
+	})
+	seedWorkspaceRepo(t, ctx, pool, wsID, "workflow-orchestrator", "git@github.com:owner/workflow-orchestrator.git")
+
+	spec := orchestrator.GoFeatureSpec{
+		WorkspaceID:    wsID,
+		OrganizationID: uuid.New(),
+		Slug:           "unblock-chain-" + uuid.New().String()[:8],
+		Title:          "Unblock Chain E2E Test Feature",
+		Tasks: []orchestrator.GoTaskSpec{
+			{
+				Name:      "ub-T1",
+				Title:     "Task to be blocked and unblocked",
+				Repo:      "workflow-orchestrator",
+				DependsOn: []string{},
+				ActorType: "agent",
+			},
+		},
+	}
+	if err := orchestrator.MaterializeFeature(ctx, pool, spec); err != nil {
+		t.Fatalf("MaterializeFeature: %v", err)
+	}
+
+	// Resolve the seeded task ID.
+	var taskID uuid.UUID
+	err := pool.QueryRow(ctx,
+		`SELECT t.task_id
+		 FROM workspace_tasks t
+		 JOIN workspace_features f USING (workspace_id, feature_id)
+		 WHERE t.workspace_id=$1 AND f.feature_name=$2 AND t.task_name='ub-T1'`,
+		wsID, spec.Slug,
+	).Scan(&taskID)
+	if err != nil {
+		t.Fatalf("resolve task ID: %v", err)
+	}
+
+	// ── Phase 1: move task to in_progress, simulate repeated max-turns failures ─
+	// Set max_turns_retry_count=2 to represent two prior max-turns retries.
+	_, err = pool.Exec(ctx,
+		`UPDATE workspace_tasks
+		 SET status='in_progress', max_turns_retry_count=2, updated_at=now()
+		 WHERE workspace_id=$1 AND task_id=$2`,
+		wsID, taskID,
+	)
+	if err != nil {
+		t.Fatalf("phase 1: set in_progress with retry count: %v", err)
+	}
+
+	// ── Phase 2: block the task (max_turns_exceeded from in_progress) ─────────
+	t.Log("phase 2: block task with max_turns_exceeded from in_progress")
+	ok, err := orchestrator.SetBlockedWithDetails(ctx, pool, wsID, taskID,
+		"max_turns_exceeded", "Exceeded EXECUTOR_MAX_RETRIES (3)", "in_progress")
+	if err != nil {
+		t.Fatalf("SetBlockedWithDetails: %v", err)
+	}
+	if !ok {
+		t.Fatal("phase 2: expected block to succeed (ok=true)")
+	}
+	if status := getTaskStatus(t, ctx, pool, wsID, taskID); status != "blocked" {
+		t.Fatalf("phase 2: status = %q after block, want blocked", status)
+	}
+
+	// Read blocked_from_status and verify the retry count is preserved.
+	var (
+		blockedFromStatus *string
+		retryCount        int32
+	)
+	err = pool.QueryRow(ctx,
+		`SELECT blocked_from_status, max_turns_retry_count
+		 FROM workspace_tasks WHERE workspace_id=$1 AND task_id=$2`,
+		wsID, taskID,
+	).Scan(&blockedFromStatus, &retryCount)
+	if err != nil {
+		t.Fatalf("phase 2: read blocked fields: %v", err)
+	}
+	if blockedFromStatus == nil || *blockedFromStatus != "in_progress" {
+		t.Fatalf("phase 2: blocked_from_status = %v, want in_progress", blockedFromStatus)
+	}
+	if retryCount != 2 {
+		t.Fatalf("phase 2: max_turns_retry_count = %d before unblock, want 2", retryCount)
+	}
+	t.Log("phase 2 PASS: blocked with blocked_from_status='in_progress'; counter preserved at 2")
+
+	// ── Phase 3: simulate workflow-backend unblock API ─────────────────────
+	// blocked_from_status="in_progress" → resume target = "ready"
+	// blocked_reason="max_turns_exceeded" → reset max_turns_retry_count = 0
+	t.Log("phase 3: simulate unblock API (in_progress → ready, reset max_turns_retry_count)")
+	simulateUnblockAPI(t, ctx, pool, wsID, taskID, "max_turns_exceeded")
+
+	if status := getTaskStatus(t, ctx, pool, wsID, taskID); status != "ready" {
+		t.Fatalf("phase 3: status = %q after unblock, want ready", status)
+	}
+	err = pool.QueryRow(ctx,
+		`SELECT max_turns_retry_count FROM workspace_tasks WHERE workspace_id=$1 AND task_id=$2`,
+		wsID, taskID,
+	).Scan(&retryCount)
+	if err != nil {
+		t.Fatalf("phase 3: read retry count after unblock: %v", err)
+	}
+	if retryCount != 0 {
+		t.Errorf("phase 3 FAIL: max_turns_retry_count = %d after unblock, want 0", retryCount)
+	}
+	t.Log("phase 3 PASS: status=ready; max_turns_retry_count reset to 0")
+
+	// ── Phase 4: orchestrator cycle — verify task is reclaimed ─────────────
+	t.Log("phase 4: run orchestrator cycle — verify unblocked task is reclaimed")
+	broker := newFaithfulBroker()
+	brokerSrv := httptest.NewServer(broker)
+	t.Cleanup(brokerSrv.Close)
+	cfg := buildCfg(wsID, brokerSrv.URL)
+	streamer := &mockStreamer{}
+	dispatcher := orchestrator.NewDispatcher(brokerSrv.URL, streamer, brokerSrv.Client(), queries.New(pool))
+	hs := orchestrator.NewHandleStore()
+
+	claimed, err := runOneCycle(ctx, pool, wsID, cfg, dispatcher, hs, &mockGitHubClient{}, "go-orchestrator/e2e-unblock")
+	if err != nil {
+		t.Fatalf("phase 4: runOneCycle: %v", err)
+	}
+	if _, found := claimed[taskID]; !found {
+		t.Error("phase 4 FAIL: unblocked task was not reclaimed by the orchestrator on the next cycle")
+	}
+	if status := getTaskStatus(t, ctx, pool, wsID, taskID); status != "in_progress" {
+		t.Errorf("phase 4 FAIL: status = %q after claim cycle, want in_progress", status)
+	}
+	t.Log("phase 4 PASS: unblocked task reclaimed → in_progress")
+	t.Log("TestUnblockChain PASS: block → unblock API (simulated) → orchestrator resume; counter reset verified")
 }

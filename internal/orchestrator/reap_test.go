@@ -19,7 +19,9 @@ func makeCompletionResponse(records []completionRecord) []byte {
 	return b
 }
 
-// fakeTransition captures calls to SetInReview / SetBlocked.
+// fakeTransition captures calls to SetInReview / SetBlocked / SetReadyFromMaxTurns,
+// the verdict routing functions added by T7 (SetReviewPassed, SetChangeRequested,
+// HandleNoVerdict), and HandleRebaseCompletion.
 type fakeTransition struct {
 	mu            sync.Mutex
 	inReviewCalls []struct {
@@ -31,6 +33,30 @@ type fakeTransition struct {
 		workspaceID uuid.UUID
 		taskUUID    uuid.UUID
 		reason      string
+		fromStatus  string
+	}
+	readyMaxTurnsCalls []struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}
+	reviewPassedCalls []struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}
+	changeRequestedCalls []struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}
+	noVerdictCalls []struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+		max         int
+	}
+	rebaseCalls []struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+		success     bool
+		maxAttempts int
 	}
 	logCalls []struct {
 		action string
@@ -38,6 +64,7 @@ type fakeTransition struct {
 	}
 	slowLookupResult *HandleEntry
 	slowLookupErr    error
+	maxTurnsCount    int32 // returned by getMaxTurnsCount
 }
 
 func (f *fakeTransition) setInReview(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, prURL string) (bool, error) {
@@ -51,15 +78,75 @@ func (f *fakeTransition) setInReview(_ context.Context, _ *pgxpool.Pool, workspa
 	return true, nil
 }
 
-func (f *fakeTransition) setBlocked(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, reason string) (bool, error) {
+func (f *fakeTransition) setBlocked(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, reason, fromStatus string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.blockedCalls = append(f.blockedCalls, struct {
 		workspaceID uuid.UUID
 		taskUUID    uuid.UUID
 		reason      string
-	}{workspaceID, taskUUID, reason})
+		fromStatus  string
+	}{workspaceID, taskUUID, reason, fromStatus})
 	return true, nil
+}
+
+func (f *fakeTransition) setReadyMaxTurns(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readyMaxTurnsCalls = append(f.readyMaxTurnsCalls, struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}{workspaceID, taskUUID})
+	return true, nil
+}
+
+func (f *fakeTransition) getMaxTurnsCount(_ context.Context, _ *pgxpool.Pool, _, _ uuid.UUID) (int32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.maxTurnsCount, nil
+}
+
+func (f *fakeTransition) setReviewPassed(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reviewPassedCalls = append(f.reviewPassedCalls, struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}{workspaceID, taskUUID})
+	return true, nil
+}
+
+func (f *fakeTransition) setChangeRequested(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.changeRequestedCalls = append(f.changeRequestedCalls, struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+	}{workspaceID, taskUUID})
+	return true, nil
+}
+
+func (f *fakeTransition) handleNoVerdict(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, max int) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.noVerdictCalls = append(f.noVerdictCalls, struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+		max         int
+	}{workspaceID, taskUUID, max})
+	return true, nil
+}
+
+func (f *fakeTransition) handleRebaseResult(_ context.Context, _ *pgxpool.Pool, workspaceID, taskUUID uuid.UUID, success bool, maxAttempts int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rebaseCalls = append(f.rebaseCalls, struct {
+		workspaceID uuid.UUID
+		taskUUID    uuid.UUID
+		success     bool
+		maxAttempts int
+	}{workspaceID, taskUUID, success, maxAttempts})
+	return nil
 }
 
 func (f *fakeTransition) lookupBySlug(_ context.Context, _ *pgxpool.Pool, _ uuid.UUID, _, _ string) (*HandleEntry, error) {
@@ -77,14 +164,28 @@ func (f *fakeTransition) appendLog(_ context.Context, _ *pgxpool.Pool, _, _, _ u
 }
 
 // newTestReaper wires a Reaper with a mock broker server and fake transitions.
+// executorMaxRetries defaults to 3 if 0 is passed.
 func newTestReaper(srv *httptest.Server, ft *fakeTransition) *Reaper {
+	return newTestReaperWithRetries(srv, ft, 3)
+}
+
+func newTestReaperWithRetries(srv *httptest.Server, ft *fakeTransition, executorMaxRetries int) *Reaper {
 	return &Reaper{
-		brokerURL:   srv.URL,
-		httpClient:  srv.Client(),
-		setInReview: ft.setInReview,
-		setBlocked:  ft.setBlocked,
-		slowLookup:  ft.lookupBySlug,
-		appendLog:   ft.appendLog,
+		brokerURL:          srv.URL,
+		httpClient:         srv.Client(),
+		maxReviewIncompls:  MaxReviewIncompletes,
+		maxRebaseAttempts:  3,
+		setInReview:        ft.setInReview,
+		setBlocked:         ft.setBlocked,
+		setReviewPassed:    ft.setReviewPassed,
+		setChangeRequested: ft.setChangeRequested,
+		handleNoVerdict:    ft.handleNoVerdict,
+		setReadyMaxTurns:   ft.setReadyMaxTurns,
+		getMaxTurnsCount:   ft.getMaxTurnsCount,
+		handleRebaseResult: ft.handleRebaseResult,
+		slowLookup:         ft.lookupBySlug,
+		appendLog:          ft.appendLog,
+		executorMaxRetries: executorMaxRetries,
 	}
 }
 
@@ -184,9 +285,9 @@ func TestReap_GoCompletion_InReview(t *testing.T) {
 	}
 }
 
-// TestReap_GoCompletion_Blocked verifies that a go completion with
-// terminal_status "blocked" calls SetBlocked with the correct reason.
-func TestReap_GoCompletion_Blocked(t *testing.T) {
+// TestReap_GoCompletion_Blocked_ImplKind verifies that a go completion with
+// terminal_status "blocked" from an impl dispatch records blocked_from_status="in_progress".
+func TestReap_GoCompletion_Blocked_ImplKind(t *testing.T) {
 	taskUUID := uuid.New()
 	featureUUID := uuid.New()
 	workspaceUUID := uuid.New()
@@ -194,6 +295,7 @@ func TestReap_GoCompletion_Blocked(t *testing.T) {
 	completion := completionRecord{
 		Handle: "handle-002",
 		Metadata: handleMetadata{
+			Kind:      "impl",
 			FeatureID: "feat",
 			TaskID:    "T2",
 		},
@@ -231,15 +333,135 @@ func TestReap_GoCompletion_Blocked(t *testing.T) {
 	if len(ft.blockedCalls) != 1 {
 		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
 	}
-	if ft.blockedCalls[0].taskUUID != taskUUID {
-		t.Errorf("taskUUID = %v, want %v", ft.blockedCalls[0].taskUUID, taskUUID)
+	call := ft.blockedCalls[0]
+	if call.taskUUID != taskUUID {
+		t.Errorf("taskUUID = %v, want %v", call.taskUUID, taskUUID)
 	}
-	if ft.blockedCalls[0].reason != "tests_failed" {
-		t.Errorf("reason = %q, want tests_failed", ft.blockedCalls[0].reason)
+	if call.reason != "tests_failed" {
+		t.Errorf("reason = %q, want tests_failed", call.reason)
+	}
+	if call.fromStatus != "in_progress" {
+		t.Errorf("fromStatus = %q, want in_progress for impl dispatch kind", call.fromStatus)
 	}
 
 	if _, found := hs.Lookup("handle-002"); found {
 		t.Error("handle-002 still in store after reap; want deleted")
+	}
+}
+
+// TestReap_GoCompletion_Blocked_ReviewKind verifies that a go completion with
+// terminal_status "blocked" from a review dispatch is treated as a no-valid-verdict
+// outcome (HandleNoVerdict), per technical-design.md's FSM: reviewing's only blocked
+// transition is "no valid verdict (>= MAX)" via review_incomplete — an agent-reported
+// block from a reviewer is not distinguished from any other missing verdict.
+func TestReap_GoCompletion_Blocked_ReviewKind(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-review-blocked",
+		Metadata: handleMetadata{
+			Kind:      "review",
+			FeatureID: "feat",
+			TaskID:    "T3",
+		},
+		Result: executorResult{
+			TerminalStatus: "blocked",
+			BlockedReason:  "missing_tool",
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("handle-review-blocked", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "feat",
+		TaskName:    "T3",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	if len(ft.blockedCalls) != 0 {
+		t.Errorf("SetBlocked called %d times, want 0 — review-kind blocked routes through HandleNoVerdict", len(ft.blockedCalls))
+	}
+	if len(ft.noVerdictCalls) != 1 {
+		t.Fatalf("HandleNoVerdict called %d times, want 1", len(ft.noVerdictCalls))
+	}
+	call := ft.noVerdictCalls[0]
+	if call.taskUUID != taskUUID {
+		t.Errorf("taskUUID = %v, want %v", call.taskUUID, taskUUID)
+	}
+	if call.max != MaxReviewIncompletes {
+		t.Errorf("max = %d, want %d", call.max, MaxReviewIncompletes)
+	}
+}
+
+// TestReap_GoCompletion_Blocked_FixKind verifies that a fix dispatch blocked
+// completion records blocked_from_status="in_progress".
+func TestReap_GoCompletion_Blocked_FixKind(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-fix-blocked",
+		Metadata: handleMetadata{
+			Kind:      "fix",
+			FeatureID: "feat",
+			TaskID:    "T4",
+		},
+		Result: executorResult{
+			TerminalStatus: "blocked",
+			BlockedReason:  "handover_for_continuation",
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("handle-fix-blocked", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "feat",
+		TaskName:    "T4",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	if len(ft.blockedCalls) != 1 {
+		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
+	}
+	if ft.blockedCalls[0].fromStatus != "in_progress" {
+		t.Errorf("fromStatus = %q, want in_progress for fix dispatch kind", ft.blockedCalls[0].fromStatus)
 	}
 }
 
@@ -431,5 +653,514 @@ func TestReap_SnakeCaseMetadataDecode(t *testing.T) {
 	}
 	if ft.inReviewCalls[0].prURL != "https://github.com/owner/repo/pull/10" {
 		t.Errorf("prURL = %q", ft.inReviewCalls[0].prURL)
+	}
+}
+
+// TestReap_DLQ_Failed verifies that terminal_status "failed" calls SetBlocked
+// with the provided blocked_reason (DLQ spawn-failure path).
+func TestReap_DLQ_Failed(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-dlq",
+		Metadata: handleMetadata{
+			FeatureID: "dlq-feat",
+			TaskID:    "T9",
+		},
+		Result: executorResult{
+			TerminalStatus: "failed",
+			BlockedReason:  "spawn_dlq_failed",
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("handle-dlq", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "dlq-feat",
+		TaskName:    "T9",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.blockedCalls) != 1 {
+		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
+	}
+	if ft.blockedCalls[0].taskUUID != taskUUID {
+		t.Errorf("taskUUID = %v, want %v", ft.blockedCalls[0].taskUUID, taskUUID)
+	}
+	if ft.blockedCalls[0].reason != "spawn_dlq_failed" {
+		t.Errorf("reason = %q, want spawn_dlq_failed", ft.blockedCalls[0].reason)
+	}
+	if len(ft.inReviewCalls) != 0 {
+		t.Errorf("SetInReview should not be called for 'failed' terminal status")
+	}
+	if _, found := hs.Lookup("handle-dlq"); found {
+		t.Error("handle should be deleted after processing")
+	}
+}
+
+// TestReap_DLQ_Failed_DefaultReason verifies that an empty blocked_reason on a
+// "failed" completion falls back to "spawn_dlq_failed".
+func TestReap_DLQ_Failed_DefaultReason(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-dlq-no-reason",
+		Metadata: handleMetadata{
+			FeatureID: "dlq-feat2",
+			TaskID:    "T10",
+		},
+		Result: executorResult{
+			TerminalStatus: "failed",
+			BlockedReason:  "", // empty — should default
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("handle-dlq-no-reason", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "dlq-feat2",
+		TaskName:    "T10",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.blockedCalls) != 1 {
+		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
+	}
+	if ft.blockedCalls[0].reason != "spawn_dlq_failed" {
+		t.Errorf("default reason = %q, want spawn_dlq_failed", ft.blockedCalls[0].reason)
+	}
+}
+
+// TestReap_MaxTurns_Retry verifies that terminal_status "max_turns" with a
+// retry count below executorMaxRetries resets in_progress→ready.
+func TestReap_MaxTurns_Retry(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-mt-retry",
+		Metadata: handleMetadata{
+			FeatureID: "mt-feat",
+			TaskID:    "T3",
+		},
+		Result: executorResult{
+			TerminalStatus: "max_turns",
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	// count=1 < executorMaxRetries=3 → should retry (set ready)
+	ft := &fakeTransition{maxTurnsCount: 1}
+	hs := NewHandleStore()
+	hs.Register("handle-mt-retry", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "mt-feat",
+		TaskName:    "T3",
+	})
+
+	r := newTestReaperWithRetries(srv, ft, 3)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.readyMaxTurnsCalls) != 1 {
+		t.Fatalf("SetReadyFromMaxTurns called %d times, want 1", len(ft.readyMaxTurnsCalls))
+	}
+	if ft.readyMaxTurnsCalls[0].taskUUID != taskUUID {
+		t.Errorf("taskUUID = %v, want %v", ft.readyMaxTurnsCalls[0].taskUUID, taskUUID)
+	}
+	if len(ft.blockedCalls) != 0 {
+		t.Errorf("SetBlocked should not be called when retries remain; called %d times", len(ft.blockedCalls))
+	}
+	if _, found := hs.Lookup("handle-mt-retry"); found {
+		t.Error("handle should be deleted after processing")
+	}
+}
+
+// TestReap_MaxTurns_Blocked verifies that terminal_status "max_turns" with a
+// retry count at or above executorMaxRetries blocks the task.
+func TestReap_MaxTurns_Blocked(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-mt-block",
+		Metadata: handleMetadata{
+			FeatureID: "mt-feat2",
+			TaskID:    "T4",
+		},
+		Result: executorResult{
+			TerminalStatus: "max_turns",
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	// count=3 >= executorMaxRetries=3 → should block
+	ft := &fakeTransition{maxTurnsCount: 3}
+	hs := NewHandleStore()
+	hs.Register("handle-mt-block", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "mt-feat2",
+		TaskName:    "T4",
+	})
+
+	r := newTestReaperWithRetries(srv, ft, 3)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.blockedCalls) != 1 {
+		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
+	}
+	if ft.blockedCalls[0].reason != "max_turns_exceeded" {
+		t.Errorf("reason = %q, want max_turns_exceeded", ft.blockedCalls[0].reason)
+	}
+	if len(ft.readyMaxTurnsCalls) != 0 {
+		t.Errorf("SetReadyFromMaxTurns should not be called when cap reached; called %d times", len(ft.readyMaxTurnsCalls))
+	}
+	if _, found := hs.Lookup("handle-mt-block"); found {
+		t.Error("handle should be deleted after processing")
+	}
+}
+
+// TestReap_MaxTurns_ZeroCount verifies that a max_turns event with count=0
+// (first occurrence) still retries when executorMaxRetries > 0.
+func TestReap_MaxTurns_ZeroCount(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "handle-mt-zero",
+		Metadata: handleMetadata{
+			FeatureID: "mt-feat3",
+			TaskID:    "T5",
+		},
+		Result: executorResult{
+			TerminalStatus: "max_turns",
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	// count=0 < executorMaxRetries=3 → first occurrence; should retry
+	ft := &fakeTransition{maxTurnsCount: 0}
+	hs := NewHandleStore()
+	hs.Register("handle-mt-zero", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "mt-feat3",
+		TaskName:    "T5",
+	})
+
+	r := newTestReaperWithRetries(srv, ft, 3)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.readyMaxTurnsCalls) != 1 {
+		t.Fatalf("SetReadyFromMaxTurns called %d times, want 1", len(ft.readyMaxTurnsCalls))
+	}
+	if len(ft.blockedCalls) != 0 {
+		t.Errorf("SetBlocked should not be called on first max_turns occurrence")
+	}
+}
+
+// TestReap_RebaseSuccess verifies terminal_status "rebase_success" routes to
+// handleRebaseResult with success=true.
+func TestReap_RebaseSuccess(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "rebase-handle-001",
+		Metadata: handleMetadata{
+			Kind:      "rebase",
+			FeatureID: "my-feature",
+			TaskID:    "T1",
+		},
+		Result: executorResult{TerminalStatus: "rebase_success"},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("rebase-handle-001", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "my-feature",
+		TaskName:    "T1",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.rebaseCalls) != 1 {
+		t.Fatalf("handleRebaseResult called %d times, want 1", len(ft.rebaseCalls))
+	}
+	call := ft.rebaseCalls[0]
+	if !call.success {
+		t.Error("expected success=true for rebase_success")
+	}
+	if call.taskUUID != taskUUID {
+		t.Errorf("taskUUID = %v, want %v", call.taskUUID, taskUUID)
+	}
+	if call.maxAttempts != 3 {
+		t.Errorf("maxAttempts = %d, want 3", call.maxAttempts)
+	}
+	// SetBlocked and SetInReview must not be called.
+	if len(ft.blockedCalls) != 0 {
+		t.Errorf("SetBlocked called unexpectedly")
+	}
+}
+
+// TestReap_RebaseFailed verifies terminal_status "rebase_failed" routes to
+// handleRebaseResult with success=false.
+func TestReap_RebaseFailed(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "rebase-handle-002",
+		Metadata: handleMetadata{
+			Kind:      "rebase",
+			FeatureID: "my-feature",
+			TaskID:    "T2",
+		},
+		Result: executorResult{TerminalStatus: "rebase_failed"},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("rebase-handle-002", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "my-feature",
+		TaskName:    "T2",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	if len(ft.rebaseCalls) != 1 {
+		t.Fatalf("handleRebaseResult called %d times, want 1", len(ft.rebaseCalls))
+	}
+	if ft.rebaseCalls[0].success {
+		t.Error("expected success=false for rebase_failed")
+	}
+}
+
+// TestReap_Blocked_RebaseKind verifies that a "blocked" completion for a
+// "rebase" kind job routes to handleRebaseResult (not SetBlocked).
+func TestReap_Blocked_RebaseKind(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "rebase-handle-003",
+		Metadata: handleMetadata{
+			Kind:      "rebase",
+			FeatureID: "my-feature",
+			TaskID:    "T3",
+		},
+		Result: executorResult{TerminalStatus: "blocked", BlockedReason: "rebase_conflict"},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("rebase-handle-003", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "my-feature",
+		TaskName:    "T3",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	// Must route to handleRebaseResult, not SetBlocked.
+	if len(ft.rebaseCalls) != 1 {
+		t.Fatalf("handleRebaseResult called %d times, want 1", len(ft.rebaseCalls))
+	}
+	if ft.rebaseCalls[0].success {
+		t.Error("expected success=false for blocked rebase job")
+	}
+	if len(ft.blockedCalls) != 0 {
+		t.Errorf("SetBlocked called unexpectedly for rebase kind")
+	}
+}
+
+// TestReap_Blocked_ImplKind verifies that a "blocked" completion for a non-rebase
+// kind (e.g. "impl") routes to SetBlocked as before.
+func TestReap_Blocked_ImplKind(t *testing.T) {
+	taskUUID := uuid.New()
+	featureUUID := uuid.New()
+	workspaceUUID := uuid.New()
+
+	completion := completionRecord{
+		Handle: "impl-handle-001",
+		Metadata: handleMetadata{
+			Kind:      "impl",
+			FeatureID: "my-feature",
+			TaskID:    "T4",
+		},
+		Result: executorResult{TerminalStatus: "blocked", BlockedReason: "tests_failed"},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ackOK(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(makeCompletionResponse([]completionRecord{completion}))
+	}))
+	defer srv.Close()
+
+	ft := &fakeTransition{}
+	hs := NewHandleStore()
+	hs.Register("impl-handle-001", HandleEntry{
+		FeatureUUID: featureUUID,
+		TaskUUID:    taskUUID,
+		FeatureName: "my-feature",
+		TaskName:    "T4",
+	})
+
+	r := newTestReaper(srv, ft)
+	if err := r.reap(context.Background(), nil, hs, workspaceUUID); err != nil {
+		t.Fatalf("reap error: %v", err)
+	}
+
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	// Must route to SetBlocked, not handleRebaseResult.
+	if len(ft.blockedCalls) != 1 {
+		t.Fatalf("SetBlocked called %d times, want 1", len(ft.blockedCalls))
+	}
+	if ft.blockedCalls[0].reason != "tests_failed" {
+		t.Errorf("blocked reason = %q, want tests_failed", ft.blockedCalls[0].reason)
+	}
+	if len(ft.rebaseCalls) != 0 {
+		t.Errorf("handleRebaseResult called unexpectedly for impl kind")
 	}
 }
